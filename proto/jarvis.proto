@@ -1,0 +1,59 @@
+syntax = "proto3";
+package jarvis;
+
+service Consumer {
+  rpc GetRecords(GetRecordsRequest) returns (stream GetRecordsResponse);
+  rpc ShutdownConsumer(ShutdownConsumerRequest) returns (ShutdownConsumerResponse);
+  rpc CheckpointConsumer(CheckpointConsumerRequest) returns (CheckpointConsumerResponse);
+}
+
+message GetRecordsRequest {
+  repeated KDSMetadata streams = 1;
+}
+
+message GetRecordsResponse {
+  repeated KDSRecord records = 1;
+}
+
+message ShutdownConsumerRequest {
+  KDSConsumer consumer = 1;
+  optional string shutdown_reason = 2;
+}
+
+message ShutdownConsumerResponse {
+  bool successful = 1;
+}
+
+message CheckpointConsumerRequest {
+  KDSConsumer consumer = 1;
+  string last_processed_sequence_number = 2;
+}
+
+message CheckpointConsumerResponse {
+  KDSConsumer consumer = 1;
+  string last_processed_sequence_number = 2;
+}
+
+message KDSConsumer {
+  string name = 1;
+  string arn = 2;
+  string shard_id = 3;
+  string stream_name = 4;
+}
+
+message KDSMetadata {
+  string name = 1;
+}
+
+message KDSRecord {
+  message KDSRecordMetadata {
+    KDSConsumer consumer = 1;
+  }
+
+  string sequence_number = 1;
+  string timestamp = 2;
+  string partition_key = 3;
+  string encryption_type = 4;
+  bytes data = 5;
+  KDSRecordMetadata metadata = 6;
+}
