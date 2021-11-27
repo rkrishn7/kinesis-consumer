@@ -8,7 +8,7 @@ service Consumer {
 }
 
 message GetRecordsRequest {
-  repeated KDSMetadata streams = 1;
+  repeated KDSConsumer consumers = 1;
 }
 
 message GetRecordsResponse {
@@ -37,7 +37,6 @@ message CheckpointConsumerResponse {
 message KDSConsumer {
   string name = 1;
   string arn = 2;
-  string shard_id = 3;
   string stream_name = 4;
 }
 

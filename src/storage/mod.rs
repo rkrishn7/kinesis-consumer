@@ -1,2 +1,3 @@
 pub mod dynamo_manager;
-mod manager;
+pub mod manager;
+pub mod memory_manager;
