@@ -16,6 +16,7 @@ path = "src/client.rs"
 [dependencies]
 tonic = "0.6"
 prost = "0.9"
+futures = "0.3"
 futures-core = "0.3"
 futures-util = "0.3"
 rusoto_core = "0.47.0"

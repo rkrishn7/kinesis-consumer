@@ -1,4 +1,4 @@
-#[derive(PartialEq, Eq, Clone)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub struct ConsumerLease {
     pub consumer_arn: String,
     pub shard_id: String,

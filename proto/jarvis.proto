@@ -3,12 +3,22 @@ package jarvis;
 
 service Consumer {
   rpc GetRecords(GetRecordsRequest) returns (stream GetRecordsResponse);
+  rpc Initialize(InitializeRequest) returns (InitializeResponse);
   rpc ShutdownConsumer(ShutdownConsumerRequest) returns (ShutdownConsumerResponse);
   rpc CheckpointConsumer(CheckpointConsumerRequest) returns (CheckpointConsumerResponse);
 }
 
 message GetRecordsRequest {
   repeated KDSConsumer consumers = 1;
+}
+
+message InitializeRequest {
+  string app_name = 1;
+  repeated string streams = 2;
+}
+
+message InitializeResponse {
+  bool successful = 1;
 }
 
 message GetRecordsResponse {
