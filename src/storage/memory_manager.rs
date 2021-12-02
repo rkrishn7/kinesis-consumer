@@ -33,6 +33,13 @@ impl SyncManager for MemoryManager {
             .collect()
     }
 
+    fn available_leases_mut(&mut self) -> Vec<&mut ConsumerLease> {
+        self.leases
+            .iter_mut()
+            .filter(|lease| lease.state == "AVAILABLE")
+            .collect()
+    }
+
     fn create_lease_if_not_exists(&mut self, lease: ConsumerLease) {
         match self
             .leases
@@ -54,6 +61,7 @@ impl SyncManager for MemoryManager {
             Some(lease) => lease.state = "NOT_AVAILABLE".to_string(),
         }
     }
+
     fn release_lease(&mut self, lease: ConsumerLease) {
         match self
             .leases

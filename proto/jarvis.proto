@@ -9,7 +9,7 @@ service Consumer {
 }
 
 message GetRecordsRequest {
-  repeated KDSConsumer consumers = 1;
+  repeated string streams = 1;
 }
 
 message InitializeRequest {
@@ -55,14 +55,9 @@ message KDSMetadata {
 }
 
 message KDSRecord {
-  message KDSRecordMetadata {
-    KDSConsumer consumer = 1;
-  }
-
   string sequence_number = 1;
   string timestamp = 2;
   string partition_key = 3;
   string encryption_type = 4;
   bytes data = 5;
-  KDSRecordMetadata metadata = 6;
 }

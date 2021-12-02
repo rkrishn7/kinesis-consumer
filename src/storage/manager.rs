@@ -14,6 +14,7 @@ pub trait Manager {
 pub trait SyncManager {
     fn checkpoint_consumer(&mut self, sequence_number: &String, consumer: &KdsConsumer);
     fn get_available_leases<'a>(&'a self) -> Vec<&'a ConsumerLease>;
+    fn available_leases_mut(&mut self) -> Vec<&mut ConsumerLease>;
     fn create_lease_if_not_exists(&mut self, lease: ConsumerLease);
     fn claim_lease(&mut self, lease: ConsumerLease);
     fn release_lease(&mut self, lease: ConsumerLease);

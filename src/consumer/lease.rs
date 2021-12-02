@@ -17,4 +17,8 @@ impl ConsumerLease {
             shard_id: shard_id,
         }
     }
+
+    pub fn claim(&mut self) {
+        self.state = "LEASED".to_string();
+    }
 }
