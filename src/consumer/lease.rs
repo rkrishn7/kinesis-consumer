@@ -21,4 +21,8 @@ impl ConsumerLease {
     pub fn claim(&mut self) {
         self.state = "LEASED".to_string();
     }
+
+    pub fn release(&mut self) {
+        self.state = "AVAILABLE".to_string();
+    }
 }

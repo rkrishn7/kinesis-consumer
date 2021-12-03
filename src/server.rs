@@ -1,16 +1,18 @@
 mod aws;
 mod consumer;
 mod proto;
+mod receiver_stream;
 mod storage;
 
 use tonic::{transport::Server, Request, Response, Status};
 
 use futures::stream::{self, StreamExt};
+use receiver_stream::ReceiverAwareStream;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::time::Duration;
-use tokio_stream::wrappers::ReceiverStream;
 
 use storage::manager::SyncManager;
 use storage::memory_manager::MemoryManager;
@@ -33,6 +35,7 @@ where
 {
     manager: Arc<Mutex<T>>,
     kinesis_client: KinesisClient,
+    streamers: Arc<Mutex<u64>>,
 }
 
 impl<T> KinesisConsumerService<T>
@@ -43,6 +46,7 @@ where
         Self {
             manager,
             kinesis_client: client,
+            streamers: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -52,7 +56,7 @@ impl<T> Consumer for KinesisConsumerService<T>
 where
     T: SyncManager + Send + Sync + 'static,
 {
-    type GetRecordsStream = ReceiverStream<Result<GetRecordsResponse, Status>>;
+    type GetRecordsStream = ReceiverAwareStream<Result<GetRecordsResponse, Status>>;
 
     async fn get_records(
         &self,
@@ -61,7 +65,27 @@ where
         let message = request.into_inner();
         let (tx, rx) = mpsc::channel(100);
 
+        let (one_tx, one_rx) = oneshot::channel::<()>();
+
         let mut manager = self.manager.lock().unwrap();
+
+        {
+            let mut streamers = self.streamers.lock().unwrap();
+            *streamers += 1;
+        }
+
+        let updater = self.streamers.clone();
+
+        tokio::spawn(async move {
+            match one_rx.await {
+                Ok(_) => {
+                    let mut streamers = updater.lock().unwrap();
+                    *streamers -= 1;
+                    println!("active streamers: {}", streamers);
+                }
+                Err(e) => println!("Error receiving receiver stream notify: {}", e),
+            }
+        });
 
         for lease in manager
             .available_leases_mut()
@@ -73,6 +97,7 @@ where
             let inner_tx = tx.clone();
             let kinesis_client = self.kinesis_client.clone();
             let lease_clone = lease.clone();
+            let manager_clone = self.manager.clone();
 
             tokio::spawn(async move {
                 let starting_position = rusoto_kinesis::StartingPosition {
@@ -80,6 +105,7 @@ where
                     timestamp: None,
                     type_: lease_clone
                         .last_processed_sn
+                        .clone()
                         .map(|_| "AFTER_SEQUENCE_NUMBER".to_string())
                         .unwrap_or("TRIM_HORIZON".to_string()),
                 };
@@ -117,9 +143,15 @@ where
                                                 })
                                             );
 
-                                            inner_tx.send(Ok(GetRecordsResponse {
+                                            match inner_tx.send(Ok(GetRecordsResponse {
                                                 records: send_records,
-                                            })).await.unwrap();
+                                            })).await {
+                                                Ok(_) => (),
+                                                Err(e) => {
+                                                    println!("{}", e);
+                                                    break
+                                                },
+                                            }
                                         },
                                         _ => todo!(),
                                     }
@@ -132,10 +164,18 @@ where
                     }
                     Err(_) => todo!(),
                 }
+
+                println!("Releasing shard lease for lease {:?}", lease_clone);
+                let mut lock = manager_clone.lock().unwrap();
+                lock.release_lease(lease_clone);
+                println!(
+                    "Shard lease released. available leases: {:?}",
+                    lock.get_available_leases()
+                );
             });
         }
 
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(ReceiverAwareStream::new(rx, Some(one_tx))))
     }
 
     async fn shutdown_consumer(
@@ -166,13 +206,16 @@ where
                     None,
                 )
                 .await
-                .expect(format!("Unable to fetch stream description for {}", stream_name).as_str())
+                .map_err(|_| tonic::Status::new(tonic::Code::Internal, "Error describing stream"))
             });
 
-        for stream_description in stream_descriptions_stream
-            .collect::<Vec<StreamDescription>>()
+        // Traverse through each stream in `message.streams`
+        for stream_description_result in stream_descriptions_stream
+            .collect::<Vec<Result<StreamDescription, tonic::Status>>>()
             .await
         {
+            let stream_description = stream_description_result?;
+
             let consumer_prefix = env!("CARGO_PKG_NAME");
             let consumer_name = format!("{}-{}", consumer_prefix, message.app_name);
             let stream_name = stream_description.stream_name;
@@ -183,15 +226,9 @@ where
                 stream_description.stream_arn.to_owned(),
             )
             .await
-            .expect(
-                format!(
-                    "Error registering stream consumer for stream {}",
-                    stream_name
-                )
-                .as_str(),
-            );
-
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            .map_err(|_| {
+                tonic::Status::new(tonic::Code::Internal, "Error registering stream consumer")
+            })?;
 
             for consumer in aws::kinesis::list_stream_consumers(
                 &self.kinesis_client,

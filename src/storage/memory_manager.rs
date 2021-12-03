@@ -66,7 +66,7 @@ impl SyncManager for MemoryManager {
         match self
             .leases
             .iter_mut()
-            .find(|l| l.consumer_arn == lease.consumer_arn)
+            .find(|l| l.consumer_arn == lease.consumer_arn && l.shard_id == lease.shard_id)
         {
             None => panic!("Lease does not exist"),
             Some(lease) => lease.state = "AVAILABLE".to_string(),
