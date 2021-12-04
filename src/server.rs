@@ -35,7 +35,7 @@ where
 {
     manager: Arc<Mutex<T>>,
     kinesis_client: KinesisClient,
-    streamers: Arc<Mutex<u64>>,
+    streamers: Arc<Mutex<usize>>,
 }
 
 impl<T> KinesisConsumerService<T>
@@ -63,11 +63,10 @@ where
         request: tonic::Request<GetRecordsRequest>,
     ) -> Result<tonic::Response<Self::GetRecordsStream>, tonic::Status> {
         let message = request.into_inner();
+        let stop = Arc::new(Mutex::new(false));
         let (tx, rx) = mpsc::channel(100);
 
         let (one_tx, one_rx) = oneshot::channel::<()>();
-
-        let mut manager = self.manager.lock().unwrap();
 
         {
             let mut streamers = self.streamers.lock().unwrap();
@@ -75,11 +74,14 @@ where
         }
 
         let updater = self.streamers.clone();
+        let stop_clone = stop.clone();
 
         tokio::spawn(async move {
             match one_rx.await {
                 Ok(_) => {
                     let mut streamers = updater.lock().unwrap();
+                    let mut stop = stop_clone.lock().unwrap();
+                    *stop = true;
                     *streamers -= 1;
                     println!("active streamers: {}", streamers);
                 }
@@ -87,93 +89,157 @@ where
             }
         });
 
-        for lease in manager
-            .available_leases_mut()
-            .iter_mut()
-            .filter(|lease| message.streams.contains(&lease.stream_name))
-        {
-            (*lease).claim();
+        let manager_guard = self.manager.clone();
+        let kinesis_client = self.kinesis_client.clone();
+        let streamers_clone = self.streamers.clone();
 
-            let inner_tx = tx.clone();
-            let kinesis_client = self.kinesis_client.clone();
-            let lease_clone = lease.clone();
-            let manager_clone = self.manager.clone();
+        let stop = stop.clone();
 
-            tokio::spawn(async move {
-                let starting_position = rusoto_kinesis::StartingPosition {
-                    sequence_number: lease_clone.last_processed_sn.clone(),
-                    timestamp: None,
-                    type_: lease_clone
-                        .last_processed_sn
-                        .clone()
-                        .map(|_| "AFTER_SEQUENCE_NUMBER".to_string())
-                        .unwrap_or("TRIM_HORIZON".to_string()),
+        tokio::spawn(async move {
+            loop {
+                let should_stop = {
+                    let should_stop = stop.lock().unwrap();
+                    *should_stop
                 };
-
-                match kinesis_client
-                    .subscribe_to_shard(rusoto_kinesis::SubscribeToShardInput {
-                        consumer_arn: lease_clone.consumer_arn.to_owned(),
-                        shard_id: lease_clone.shard_id.to_owned(),
-                        starting_position,
-                    })
-                    .await
+                
+                if should_stop { break; }
+                
+                let mut futs = Vec::new();
                 {
-                    Ok(output) => {
-                        let mut event_stream = output.event_stream;
+                    let mut manager = manager_guard.lock().unwrap();
+                    let streamers_count = streamers_clone.lock().unwrap();
 
-                        while let Some(item) = event_stream.next().await {
-                            match item {
-                                Ok(payload) => {
-                                    println!("Got event from the event stream: {:?}", payload);
-                                    println!("shard id: {}", lease_clone.shard_id);
+                    let mut available_leases = manager
+                        .available_leases_mut()
+                        .into_iter()
+                        .filter(|lease| message.streams.contains(&lease.stream_name))
+                        .collect::<Vec<&mut ConsumerLease>>();
 
-                                    match payload {
-                                        rusoto_kinesis::SubscribeToShardEventStreamItem::SubscribeToShardEvent(e) => {
-                                            let mut send_records: Vec<KdsRecord> = Vec::new();
+                    let mut i = 0;
+                    let max = (available_leases.len() as f32 / *streamers_count as f32).ceil() as usize;
 
-                                            send_records.extend(
-                                                e.records.into_iter().map(|record| {
-                                                    KdsRecord {
-                                                        sequence_number: record.sequence_number,
-                                                        timestamp: record.approximate_arrival_timestamp.unwrap().to_string(),
-                                                        partition_key: record.partition_key,
-                                                        encryption_type: record.encryption_type.unwrap_or(String::from("")).to_string(),
-                                                        data: record.data.into_iter().collect(),
-                                                    }
-                                                })
-                                            );
+                    while i < max
+                    {
+                        println!("max {}", max);
+                        (available_leases[i]).claim();
+                        let lease = available_leases[i].clone();
 
-                                            match inner_tx.send(Ok(GetRecordsResponse {
-                                                records: send_records,
-                                            })).await {
-                                                Ok(_) => (),
-                                                Err(e) => {
-                                                    println!("{}", e);
-                                                    break
-                                                },
+                        let inner_tx = tx.clone();
+
+                        let lease_clone = lease.clone();
+                        let manager_clone = manager_guard.clone();
+                        let kinesis_client = kinesis_client.clone();
+
+                        let stop = stop.clone();
+
+                        futs.push(async move {
+                            let lease_clone_2 = lease_clone.clone();
+                            let _ = tokio::time::timeout(Duration::from_secs(20), async move {
+                                let starting_position = rusoto_kinesis::StartingPosition {
+                                    sequence_number: lease_clone.last_processed_sn.clone(),
+                                    timestamp: None,
+                                    type_: lease_clone
+                                        .last_processed_sn
+                                        .clone()
+                                        .map(|_| "AFTER_SEQUENCE_NUMBER".to_string())
+                                        .unwrap_or("TRIM_HORIZON".to_string()),
+                                };
+        
+                                match kinesis_client
+                                    .subscribe_to_shard(rusoto_kinesis::SubscribeToShardInput {
+                                        consumer_arn: lease_clone.consumer_arn.to_owned(),
+                                        shard_id: lease_clone.shard_id.to_owned(),
+                                        starting_position,
+                                    })
+                                    .await
+                                {
+                                    Ok(output) => {
+                                        let mut event_stream = output.event_stream;
+        
+                                        while let Some(item) = event_stream.next().await {
+                                            let _should_stop = {
+                                                let should_stop = stop.lock().unwrap();
+                                                *should_stop
+                                            };
+
+                                            println!("_should stop {}", _should_stop);
+
+                                            if _should_stop {
+                                                println!("stopping event stream reading");
+                                                break;
                                             }
-                                        },
-                                        _ => todo!(),
+
+                                            match item {
+                                                Ok(payload) => {
+                                                    println!(
+                                                        "Got event from the event stream: {:?}",
+                                                        payload
+                                                    );
+                                                    println!("shard id: {}", lease_clone.shard_id);
+        
+                                                    match payload {
+                                                        rusoto_kinesis::SubscribeToShardEventStreamItem::SubscribeToShardEvent(e) => {
+                                                            let mut send_records: Vec<KdsRecord> = Vec::new();
+        
+                                                            send_records.extend(
+                                                                e.records.into_iter().map(|record| {
+                                                                    KdsRecord {
+                                                                        sequence_number: record.sequence_number,
+                                                                        timestamp: record.approximate_arrival_timestamp.unwrap().to_string(),
+                                                                        partition_key: record.partition_key,
+                                                                        encryption_type: record.encryption_type.unwrap_or(String::from("")).to_string(),
+                                                                        data: record.data.into_iter().collect(),
+                                                                    }
+                                                                })
+                                                            );
+        
+                                                            match inner_tx.send(Ok(GetRecordsResponse {
+                                                                records: send_records,
+                                                            })).await {
+                                                                Ok(_) => (),
+                                                                Err(e) => {
+                                                                    println!("{}", e);
+                                                                    break
+                                                                },
+                                                            }
+                                                        },
+                                                        _ => todo!(),
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    println!("{:?}", e);
+                                                }
+                                            }
+                                        }
                                     }
+                                    Err(_) => todo!(),
                                 }
-                                Err(e) => {
-                                    println!("{:?}", e);
-                                }
+                            }).await;
+                            {
+                                println!("Releasing shard lease for lease {:?}", lease_clone_2);
+                                let mut lock = manager_clone.lock().unwrap();
+                                lock.release_lease(lease);
+                                println!(
+                                    "Shard lease released. available leases: {:?}",
+                                    lock.get_available_leases()
+                                );
                             }
-                        }
+                        });
+
+                        i += 1;
                     }
-                    Err(_) => todo!(),
                 }
 
-                println!("Releasing shard lease for lease {:?}", lease_clone);
-                let mut lock = manager_clone.lock().unwrap();
-                lock.release_lease(lease_clone);
-                println!(
-                    "Shard lease released. available leases: {:?}",
-                    lock.get_available_leases()
-                );
-            });
-        }
+                if futs.len() == 0 {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                } else {
+                    futures::future::join_all(futs).await;
+                }
+
+            }
+
+            println!("broke outer loop");
+        });
 
         Ok(Response::new(ReceiverAwareStream::new(rx, Some(one_tx))))
     }
