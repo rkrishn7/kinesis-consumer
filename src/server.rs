@@ -109,6 +109,8 @@ where
                     let mut manager = manager_guard.lock().unwrap();
                     let streamers_count = streamers_clone.lock().unwrap();
 
+                    let max = (manager.get_lease_count(&message.streams) + (*streamers_count - 1)) / *streamers_count;
+
                     let mut available_leases = manager
                         .available_leases_mut()
                         .into_iter()
@@ -116,9 +118,8 @@ where
                         .collect::<Vec<&mut ConsumerLease>>();
 
                     let mut i = 0;
-                    let max = (available_leases.len() as f32 / *streamers_count as f32).ceil() as usize;
 
-                    while i < max
+                    while i < max && i < available_leases.len()
                     {
                         println!("max {}", max);
                         (available_leases[i]).claim();

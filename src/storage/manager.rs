@@ -18,4 +18,5 @@ pub trait SyncManager {
     fn create_lease_if_not_exists(&mut self, lease: ConsumerLease);
     fn claim_lease(&mut self, lease: ConsumerLease);
     fn release_lease(&mut self, lease: ConsumerLease);
+    fn get_lease_count(&self, streams: &Vec<String>) -> usize;
 }

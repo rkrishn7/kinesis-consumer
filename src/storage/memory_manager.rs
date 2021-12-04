@@ -72,4 +72,18 @@ impl SyncManager for MemoryManager {
             Some(lease) => lease.state = "AVAILABLE".to_string(),
         }
     }
+
+    fn get_lease_count(&self, streams: &Vec<String>) -> usize {
+        let mut count: usize = 0;
+
+        for stream in streams.iter() {
+            count += self
+                .leases
+                .iter()
+                .filter(|lease| lease.stream_name == *stream)
+                .count()
+        }
+
+        count
+    }
 }
