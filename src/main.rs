@@ -1,14 +1,14 @@
 mod aws;
+mod connection_manager;
 mod consumer;
 mod proto;
-mod receiver_stream;
+mod receiver_aware_stream;
 mod storage;
-mod connection_manager;
 
 use tonic::{transport::Server, Response, Status};
 
 use futures::stream::{self, StreamExt};
-use receiver_stream::ReceiverAwareStream;
+use receiver_aware_stream::ReceiverAwareStream;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
@@ -28,16 +28,26 @@ use proto::{
 use rusoto_kinesis::KinesisClient;
 use rusoto_kinesis::StreamDescription;
 
-use connection_manager::{MemoryConnectionManager, ConnectionManager};
+use connection_manager::{ConnectionManager, MemoryConnectionManager};
 
-pub struct AsyncKinesisConsumerService<T, U: ConnectionManager> {
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref CONSUMER_ID: uuid::Uuid = uuid::Uuid::new_v4();
+}
+
+pub struct KinesisConsumerService<T, U: ConnectionManager> {
     storage_backend: T,
     kinesis_client: KinesisClient,
     connection_manager: U,
 }
 
-impl<T, U: ConnectionManager> AsyncKinesisConsumerService<T, U> {
-    pub fn new(storage_backend: T, client: KinesisClient, connection_manager: U) -> Self {
+impl<T, U: ConnectionManager> KinesisConsumerService<T, U> {
+    pub fn new(
+        storage_backend: T,
+        client: KinesisClient,
+        connection_manager: U,
+    ) -> Self {
         Self {
             storage_backend,
             kinesis_client: client,
@@ -47,7 +57,7 @@ impl<T, U: ConnectionManager> AsyncKinesisConsumerService<T, U> {
 }
 
 #[tonic::async_trait]
-impl<T, U> Consumer for AsyncKinesisConsumerService<T, U>
+impl<T, U> Consumer for KinesisConsumerService<T, U>
 where
     T: AsyncKinesisStorageBackend + Send + Sync + Clone + 'static,
     U: ConnectionManager + Send + Sync + Clone + 'static,
@@ -62,56 +72,54 @@ where
         let remote_addr = request.remote_addr();
         let message = request.into_inner();
         let stop = Arc::new(Mutex::new(false));
-        let (tx, rx) = mpsc::channel(100);
-
-        let (one_tx, one_rx) = oneshot::channel::<()>();
+        let (record_sender, record_receiver) = mpsc::channel(100);
+        let (stream_dropped_notifier, stream_dropped_receiver) =
+            oneshot::channel::<()>();
 
         let streams = &message
-        .streams
-        .iter()
-        .map(AsRef::as_ref)
-        .collect::<Vec<&str>>();
+            .streams
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>();
 
-        self.connection_manager.add_connection_for_streams(streams, remote_addr);
-
-        println!("Connections {:?}", self.connection_manager.get_connections_for_streams(streams));
+        self.connection_manager
+            .add_connection_for_streams(streams, remote_addr);
 
         let connection_manager = self.connection_manager.clone();
-        let stop_clone = stop.clone();
 
         let streams = message.streams.clone();
 
+        let should_stop = stop.clone();
+
+        // Spawn a task that waits until the `record_receiver` handle
+        // has been dropped, which indicates the client has disconnected.
+        // Subsequently, set `should_stop` to `true` and remove the connection
+        // so we can kill dangling tasks and redistribute shards among the
+        // active record processors.
         tokio::spawn(async move {
-            match one_rx.await {
-                Ok(_) => {
-                    let streams = &streams
-                    .iter()
-                    .map(AsRef::as_ref)
-                    .collect::<Vec<&str>>();
-                    let _ = connection_manager.remove_connection_for_streams(streams, remote_addr);
-                    println!("Connections {:?}", connection_manager.get_connections_for_streams(streams));
-                    let mut stop = stop_clone.lock().unwrap();
-                    *stop = true;
-                }
-                Err(e) => {
-                    println!("Error receiving receiver stream notify: {}", e)
-                }
-            }
+            let _ = stream_dropped_receiver.await;
+            *should_stop.lock().unwrap() = true;
+            let streams =
+                &streams.iter().map(AsRef::as_ref).collect::<Vec<&str>>();
+            connection_manager
+                .remove_connection_for_streams(streams, remote_addr)
+                .expect(
+                    "Unable to remove connection. 
+            This will result in an incorrect shard distribution across record 
+            processors, which may result in shards being starved",
+                );
         });
 
         let storage_backend = self.storage_backend.clone();
         let kinesis_client = self.kinesis_client.clone();
         let connection_manager = self.connection_manager.clone();
+        let should_stop = stop;
 
         tokio::spawn(async move {
             loop {
-                // We need to reassign leases if one of the following occur:
-                // 1. A new connection starts attempting to stream records
-                //    from a set of streams that intersects with the streams
-                //    in the parent task's `request.message.streams`.
-                // 2. A connection that was reading from a set of streams that
-                //    intersects with the parent task's set of streams has dropped.
-                if *stop.lock().unwrap() {
+                // When the client's connection drops, we must break so
+                // we don't keep tasks unnecessarily running.
+                if *should_stop.lock().unwrap() {
                     break;
                 }
 
@@ -121,15 +129,20 @@ where
                     .map(AsRef::as_ref)
                     .collect::<Vec<&str>>();
 
+                // In order to evenly distribute shards to record processing clients,
+                // we calculate a limit by dividing the total number of available leases
+                // by the total number of connections, for `streams`. Only `limit` leases
+                // are claimed by this task.
                 let limit = {
-                    let connection_count = connection_manager.get_connection_count_for_streams(streams) as i64;
+                    let connection_count = connection_manager
+                        .get_connection_count_for_streams(streams)
+                        as i64;
                     let lease_count = storage_backend
                         .get_lease_count_for_streams(streams)
                         .await
                         .unwrap();
 
-                    (lease_count + ((connection_count) - 1))
-                        / connection_count
+                    (lease_count + ((connection_count) - 1)) / connection_count
                 };
 
                 let claimed_leases = storage_backend
@@ -140,26 +153,34 @@ where
                 let mut task_handles = Vec::new();
 
                 for lease in claimed_leases {
-                    let tx = tx.clone();
+                    let record_sender = record_sender.clone();
                     let storage_backend = storage_backend.clone();
                     let kinesis_client = kinesis_client.clone();
-                    let stop = stop.clone();
+                    let should_stop = should_stop.clone();
 
                     task_handles.push(tokio::task::spawn(async move {
-                        let lease_clone = lease.clone();
                         let _ = tokio::time::timeout(
                             Duration::from_secs(20),
-                            async move {
+                            async {
                                 let starting_position_type;
                                 match &lease.last_processed_sn {
                                     Some(_) => starting_position_type = "AFTER_SEQUENCE_NUMBER".to_string(),
                                     None => starting_position_type = "TRIM_HORIZON".to_string(),
                                 }
 
-                                let mut event_stream = aws::kinesis::subscribe_to_shard(&kinesis_client, (&lease.shard_id).to_owned(), (&lease.consumer_arn).to_owned(), starting_position_type, None, lease.last_processed_sn.clone()).await.unwrap();
+                                let mut event_stream = aws::kinesis::subscribe_to_shard(
+                                    &kinesis_client,
+                                    (&lease.shard_id).to_owned(),
+                                    (&lease.consumer_arn).to_owned(),
+                                    starting_position_type,
+                                    None,
+                                    lease.last_processed_sn.clone())
+                                    .await.unwrap();
 
                                 while let Some(item) = event_stream.next().await {
-                                    if *stop.lock().unwrap() {
+                                    // When the client's connection drops, we must break so
+                                    // we don't keep tasks unnecessarily running.
+                                    if *should_stop.lock().unwrap() {
                                         break;
                                     }
 
@@ -187,7 +208,7 @@ where
                                                         })
                                                     );
 
-                                                    match tx.send(Ok(GetRecordsResponse {
+                                                    match record_sender.send(Ok(GetRecordsResponse {
                                                         records: send_records,
                                                     })).await {
                                                         Ok(_) => (),
@@ -208,23 +229,21 @@ where
                             },
                         )
                         .await;
-                        
-                        println!(
-                            "Releasing shard lease for lease {:?}",
-                            lease_clone
-                        );
-                        let _ = storage_backend
+
+                        storage_backend
                             .release_lease(
-                                &lease_clone.consumer_arn,
-                                &lease_clone.stream_name,
-                                &lease_clone.shard_id,
+                                &lease.consumer_arn,
+                                &lease.stream_name,
+                                &lease.shard_id,
                             )
                             .await
-                            .unwrap();
+                            .expect(format!("Unable to release the following lease: {}. This may result in shards being starved.", lease).as_str());
                     }));
                 }
 
                 if task_handles.len() == 0 {
+                    // Sleep the current task to avoid eating up CPU
+                    // while there is no work to be done.
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 } else {
                     futures::future::join_all(task_handles).await;
@@ -232,7 +251,10 @@ where
             }
         });
 
-        Ok(Response::new(ReceiverAwareStream::new(rx, Some(one_tx))))
+        Ok(Response::new(ReceiverAwareStream::new(
+            record_receiver,
+            Some(stream_dropped_notifier),
+        )))
     }
 
     async fn shutdown_consumer(
@@ -347,11 +369,28 @@ where
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:50051".parse()?;
-    let storage_backend = PostgresKinesisStorageBackend::init().await;
+
+    // Postgres storage backend initialization
+    // TODO: add check when more storage backends are added
+    let mut postgres_storage_backend = PostgresKinesisStorageBackend::new(
+        &*CONSUMER_ID,
+        std::env::var("POSTGRES_DATABASE_URL").expect(
+            "
+        Expected environment variable `POSTGRES_DATABASE_URL` 
+        when using value postgres as a storage backend",
+        ),
+    );
+    postgres_storage_backend
+        .init()
+        .await
+        .expect("Unable to initialize postgres storage backend");
     let kinesis_client = aws::kinesis::create_client();
     let connection_manager = MemoryConnectionManager::new();
-    let consumer =
-        AsyncKinesisConsumerService::new(storage_backend, kinesis_client, connection_manager);
+    let consumer = KinesisConsumerService::new(
+        postgres_storage_backend,
+        kinesis_client,
+        connection_manager,
+    );
 
     Server::builder()
         .add_service(ConsumerServer::new(consumer))

@@ -2,23 +2,68 @@ use super::AsyncKinesisStorageBackend;
 use crate::consumer::lease::ConsumerLease;
 use async_trait::async_trait;
 
-use std::{env, sync::Arc};
+use std::sync::Arc;
 
 const CONSUMER_LEASES_TABLE_NAME: &'static str =
     "kinesis_butler_consumer_leases";
 
 #[derive(Clone)]
 pub struct PostgresKinesisStorageBackend {
-    client: Arc<tokio_postgres::Client>,
+    client: Option<Arc<tokio_postgres::Client>>,
+    connection_url: String,
+    consumer_id: &'static uuid::Uuid,
 }
 
 impl PostgresKinesisStorageBackend {
-    pub async fn init() -> Self {
-        let postgres_url = env::var("POSTGRES_DATABASE_URL").expect("Expected environment variable `POSTGRES_DATABASE_URL` when using value postgres as a storage backend");
-        let (client, connection) =
-            tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
-                .await
-                .expect("Unable to initialize postgres client");
+    pub fn new(
+        consumer_id: &'static uuid::Uuid,
+        connection_url: String,
+    ) -> Self {
+        Self {
+            client: None,
+            consumer_id,
+            connection_url,
+        }
+    }
+
+    pub async fn init(&mut self) -> Result<(), tokio_postgres::Error> {
+        let (client, connection) = tokio_postgres::connect(
+            &self.connection_url,
+            tokio_postgres::NoTls,
+        )
+        .await?;
+
+        self.client = Some(Arc::new(client));
+
+        let client = self.client.clone();
+        let consumer_id = self.consumer_id.clone();
+
+        // Release all leases claimed by this consumer, if any,
+        // upon graceful shutdown.
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.unwrap();
+            match client
+                .as_ref()
+                .unwrap()
+                .execute(
+                    format!(
+                        "UPDATE {} SET consumer_id = NULL WHERE consumer_id = $1",
+                        CONSUMER_LEASES_TABLE_NAME
+                    )
+                    .as_str(),
+                    &[&consumer_id],
+                )
+                .await {
+                    Ok(_) => {
+                        println!("Released claimed leases for consumer process {}", consumer_id);
+                        std::process::exit(0)
+                    },
+                    Err(e) => {
+                        eprintln!("Unable to release claimed leases for consumer process {}. Caused by error: {}", consumer_id, e);
+                        std::process::exit(1);
+                    },
+                }
+        });
 
         tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -26,7 +71,9 @@ impl PostgresKinesisStorageBackend {
             }
         });
 
-        client
+        self.client
+            .as_ref()
+            .unwrap()
             .batch_execute(
                 format!(
                     "CREATE TABLE IF NOT EXISTS {} ( 
@@ -34,7 +81,7 @@ impl PostgresKinesisStorageBackend {
               consumer_arn        VARCHAR(255) NOT NULL,
               shard_id            VARCHAR(255) NOT NULL,
               stream_name         VARCHAR(255) NOT NULL,
-              leased              BOOLEAN DEFAULT false,
+              consumer_id         UUID DEFAULT NULL,
               last_processed_sn   VARCHAR(255) DEFAULT NULL,
               UNIQUE (consumer_arn, shard_id, stream_name)
             )",
@@ -42,12 +89,9 @@ impl PostgresKinesisStorageBackend {
                 )
                 .as_str(),
             )
-            .await
-            .expect("Unable to create consumer leases table");
+            .await?;
 
-        Self {
-            client: Arc::new(client),
-        }
+        Ok(())
     }
 }
 
@@ -62,9 +106,9 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
         limit: i64,
         streams: &Vec<&str>,
     ) -> Result<Vec<ConsumerLease>, Box<dyn std::error::Error>> {
-        let rows = self.client.query(format!(
-                "UPDATE {0} SET leased = true WHERE id in (SELECT id FROM {0} WHERE stream_name = ANY($1) AND leased = false LIMIT $2) RETURNING *", CONSUMER_LEASES_TABLE_NAME).as_str(),
-                &[streams, &limit],
+        let rows = self.client.as_ref().unwrap().query(format!(
+                "UPDATE {0} SET consumer_id = $1 WHERE id in (SELECT id FROM {0} WHERE stream_name = ANY($2) AND consumer_id IS NULL LIMIT $3) RETURNING *", CONSUMER_LEASES_TABLE_NAME).as_str(),
+                &[&self.consumer_id, streams, &limit],
             )
             .await?;
 
@@ -73,7 +117,7 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
             .map(|row| ConsumerLease {
                 consumer_arn: row.get("consumer_arn"),
                 shard_id: row.get("shard_id"),
-                leased: row.get("leased"),
+                consumer_id: row.get("consumer_id"),
                 stream_name: row.get("stream_name"),
                 last_processed_sn: row.get("last_processed_sn"),
             })
@@ -88,6 +132,8 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self
             .client
+            .as_ref()
+            .unwrap()
             .execute(
                 format!("INSERT INTO {} (consumer_arn, shard_id, stream_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", CONSUMER_LEASES_TABLE_NAME).as_str(),
                 &[
@@ -107,11 +153,12 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
         stream_name: &str,
         shard_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let updated = self
-            .client
+        self.client
+            .as_ref()
+            .unwrap()
             .execute(
                 format!(
-                    "UPDATE {} SET leased = false WHERE 
+                    "UPDATE {} SET consumer_id = NULL WHERE 
                 consumer_arn = $1 AND shard_id = $2 AND stream_name = $3
                 ",
                     CONSUMER_LEASES_TABLE_NAME
@@ -121,8 +168,6 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
             )
             .await?;
 
-        println!("Updated {}", updated);
-
         Ok(())
     }
 
@@ -130,7 +175,7 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
         &self,
         streams: &Vec<&str>,
     ) -> Result<i64, Box<dyn std::error::Error>> {
-        let row = self.client.query_one(format!(
+        let row = self.client.as_ref().unwrap().query_one(format!(
         "SELECT COUNT(*) FROM {0} WHERE id in (SELECT id FROM {0} WHERE stream_name = ANY($1))", CONSUMER_LEASES_TABLE_NAME).as_str(),
         &[streams],
         )
