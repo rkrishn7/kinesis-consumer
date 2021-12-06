@@ -14,16 +14,12 @@ name = "helloworld-client"
 path = "src/client.rs"
 
 [dependencies]
-tonic = "0.6"
+tonic = { version = "0.6", features = ["transport"] }
 prost = "0.9"
 futures = "0.3"
-futures-core = "0.3"
-futures-util = "0.3"
 rusoto_core = "0.47.0"
 rusoto_kinesis = "0.47.0"
-rusoto_dynamodb = "0.47.0"
-aws-config = "0.0.26-alpha"
-aws-sdk-kinesis = "0.0.26-alpha"
+tokio-postgres = "0.7.5"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1"
 async-trait = "0.1.51"

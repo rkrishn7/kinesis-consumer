@@ -1,13 +1,16 @@
+use rusoto_core::event_stream::EventStream;
 use rusoto_core::{Region, RusotoError};
 use rusoto_kinesis::{
-    Consumer, ConsumerDescription, DescribeStreamConsumerError, DescribeStreamConsumerInput,
-    DescribeStreamError, DescribeStreamInput, ListShardsError, ListShardsInput,
-    ListStreamConsumersError, ListStreamConsumersInput, RegisterStreamConsumerError,
-    RegisterStreamConsumerInput, Shard, StartingPosition, StreamDescription, SubscribeToShardError,
+    Consumer, ConsumerDescription, DescribeStreamConsumerError,
+    DescribeStreamConsumerInput, DescribeStreamError, DescribeStreamInput,
+    ListShardsError, ListShardsInput, ListStreamConsumersError,
+    ListStreamConsumersInput, RegisterStreamConsumerError,
+    RegisterStreamConsumerInput, Shard, StartingPosition, StreamDescription,
+    SubscribeToShardError, SubscribeToShardEventStreamItem,
 };
 use rusoto_kinesis::{Kinesis, KinesisClient};
 
-pub async fn create_client() -> KinesisClient {
+pub fn create_client() -> KinesisClient {
     KinesisClient::new(Region::default())
 }
 
@@ -71,7 +74,10 @@ pub async fn subscribe_to_shard(
     starting_position_type: String,
     timestamp: Option<f64>,
     sequence_number: Option<String>,
-) -> Result<impl futures::Stream, RusotoError<SubscribeToShardError>> {
+) -> Result<
+    EventStream<SubscribeToShardEventStreamItem>,
+    RusotoError<SubscribeToShardError>,
+> {
     let input = rusoto_kinesis::SubscribeToShardInput {
         consumer_arn,
         shard_id,
@@ -105,7 +111,9 @@ pub async fn register_stream_consumer_if_not_exists(
 ) -> Result<(), RusotoError<RegisterStreamConsumerError>> {
     match register_stream_consumer(client, consumer_name, stream_arn).await {
         Ok(_) => Ok(()),
-        Err(RusotoError::Service(RegisterStreamConsumerError::ResourceInUse(_))) => Ok(()),
+        Err(RusotoError::Service(
+            RegisterStreamConsumerError::ResourceInUse(_),
+        )) => Ok(()),
         Err(e) => Err(e),
     }
 }

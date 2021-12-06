@@ -13,7 +13,11 @@ impl MemoryManager {
 }
 
 impl SyncManager for MemoryManager {
-    fn checkpoint_consumer(&mut self, sequence_number: &String, consumer: &KdsConsumer) {
+    fn checkpoint_consumer(
+        &mut self,
+        sequence_number: &String,
+        consumer: &KdsConsumer,
+    ) {
         match self
             .leases
             .iter_mut()
@@ -41,11 +45,9 @@ impl SyncManager for MemoryManager {
     }
 
     fn create_lease_if_not_exists(&mut self, lease: ConsumerLease) {
-        match self
-            .leases
-            .iter()
-            .find(|&l| l.consumer_arn == lease.consumer_arn && l.shard_id == lease.shard_id)
-        {
+        match self.leases.iter().find(|&l| {
+            l.consumer_arn == lease.consumer_arn && l.shard_id == lease.shard_id
+        }) {
             None => self.leases.push(lease),
             Some(_) => {}
         }
@@ -63,13 +65,25 @@ impl SyncManager for MemoryManager {
     }
 
     fn release_lease(&mut self, lease: ConsumerLease) {
-        match self
-            .leases
-            .iter_mut()
-            .find(|l| l.consumer_arn == lease.consumer_arn && l.shard_id == lease.shard_id)
-        {
+        match self.leases.iter_mut().find(|l| {
+            l.consumer_arn == lease.consumer_arn && l.shard_id == lease.shard_id
+        }) {
             None => panic!("Lease does not exist"),
             Some(lease) => lease.state = "AVAILABLE".to_string(),
         }
+    }
+
+    fn get_lease_count(&self, streams: &Vec<String>) -> usize {
+        let mut count: usize = 0;
+
+        for stream in streams.iter() {
+            count += self
+                .leases
+                .iter()
+                .filter(|lease| lease.stream_name == *stream)
+                .count()
+        }
+
+        count
     }
 }
