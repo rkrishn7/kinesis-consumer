@@ -1,9 +1,16 @@
+//! Asynchronous stream with a notification-based drop implementation.
+
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot::Sender;
 use tokio_stream::Stream;
 
+/// A wrapper around `tokio::sync::mpsc::Receiver` that
+/// sends a single message to a `tokio::sync::oneshot`
+/// channel when it is dropped.
 pub struct ReceiverAwareStream<T> {
+    /// The wrapped `Receiver`
     inner: Receiver<T>,
+    /// `oneshot::Sender` for drop notification
     notifier: Option<Sender<()>>,
 }
 
@@ -30,10 +37,7 @@ impl<T> Stream for ReceiverAwareStream<T> {
 impl<T> Drop for ReceiverAwareStream<T> {
     fn drop(&mut self) {
         if let Some(notifier) = self.notifier.take() {
-            match notifier.send(()) {
-                Ok(_) => (),
-                Err(e) => println!("Error notifying dropped receiver"),
-            }
+            let _ = notifier.send(());
         }
     }
 }
