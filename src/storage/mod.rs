@@ -25,4 +25,8 @@ pub trait AsyncKinesisStorageBackend {
         stream_name: &str,
         shard_id: &str,
     ) -> KinesisStorageBackendResult<()>;
+    async fn get_lease_count_for_streams(
+        &self,
+        streams: &Vec<&str>,
+    ) -> KinesisStorageBackendResult<i64>;
 }

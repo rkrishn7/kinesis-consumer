@@ -35,7 +35,7 @@ impl PostgresKinesisStorageBackend {
               shard_id            VARCHAR(255) NOT NULL,
               stream_name         VARCHAR(255) NOT NULL,
               leased              BOOLEAN DEFAULT false,
-              last_processed_sn   VARCHAR(255) NULL,
+              last_processed_sn   VARCHAR(255) DEFAULT NULL,
               UNIQUE (consumer_arn, shard_id, stream_name)
             )",
                     CONSUMER_LEASES_TABLE_NAME
@@ -124,5 +124,18 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
         println!("Updated {}", updated);
 
         Ok(())
+    }
+
+    async fn get_lease_count_for_streams(
+        &self,
+        streams: &Vec<&str>,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        let row = self.client.query_one(format!(
+        "SELECT COUNT(*) FROM {0} WHERE id in (SELECT id FROM {0} WHERE stream_name = ANY($1))", CONSUMER_LEASES_TABLE_NAME).as_str(),
+        &[streams],
+        )
+        .await?;
+
+        Ok(row.get(0))
     }
 }

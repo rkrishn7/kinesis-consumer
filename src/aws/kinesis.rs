@@ -10,7 +10,7 @@ use rusoto_kinesis::{
 };
 use rusoto_kinesis::{Kinesis, KinesisClient};
 
-pub async fn create_client() -> KinesisClient {
+pub fn create_client() -> KinesisClient {
     KinesisClient::new(Region::default())
 }
 
