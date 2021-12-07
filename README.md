@@ -1,12 +1,12 @@
 # Kinesis Butler
 
-A task-based gRPC server that subscribes to Kinesis Data Streams. Built on the [Tokio](https://github.com/tokio-rs/tokio) runtime.
+A task-based gRPC server that subscribes to Kinesis Data Streams. Built with [Tonic](https://github.com/hyperium/tonic) on the [Tokio](https://github.com/tokio-rs/tokio) runtime.
 
 ![diagram](/diagram.png)
 
 ## Overview
 
-Managing subscriptions across multiple shards, handling I/O failures, and checkpointing processed records are common tasks when using Kinesis Data Streams. However, writing robust software to handle these complexities can be challenging. Moreover, if you want to write record processors in different programming languages, porting your implementation can be time-consuming and tedious.
+Managing subscriptions across multiple shards, handling I/O failures, and checkpointing processed records are common tasks when using Kinesis Data Streams. However, writing robust software to handle these complexities can be challenging. Moreover, if you want to write record processors in different programming languages, porting implementations can be time-consuming and tedious.
 
 Kinesis Butler decouples record consumption from record processing, enabling developers to easily consume data from [Amazon Kinesis](http://aws.amazon.com/kinesis) while giving them the flexibility to write record processing logic in a variety of [supported languages](https://grpc.io/docs/languages/).
 
