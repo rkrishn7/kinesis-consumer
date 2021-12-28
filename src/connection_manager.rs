@@ -5,19 +5,19 @@ use std::sync::{Arc, Mutex};
 pub trait ConnectionManager {
     fn add_connection_for_streams(
         &self,
-        streams: &Vec<&str>,
+        streams: &Vec<String>,
         connection: Option<SocketAddr>,
     );
     fn remove_connection_for_streams(
         &self,
-        streams: &Vec<&str>,
+        streams: &Vec<String>,
         connection: Option<SocketAddr>,
     ) -> Result<Option<SocketAddr>, ()>;
     fn get_connections_for_streams(
         &self,
-        streams: &Vec<&str>,
+        streams: &Vec<String>,
     ) -> Vec<Option<SocketAddr>>;
-    fn get_connection_count_for_streams(&self, streams: &Vec<&str>) -> usize;
+    fn get_connection_count_for_streams(&self, streams: &Vec<String>) -> usize;
 }
 
 #[derive(Clone)]
@@ -36,7 +36,7 @@ impl MemoryConnectionManager {
 impl ConnectionManager for MemoryConnectionManager {
     fn add_connection_for_streams(
         &self,
-        streams: &Vec<&str>,
+        streams: &Vec<String>,
         connection: Option<SocketAddr>,
     ) {
         let mut map = self.inner.lock().unwrap();
@@ -54,7 +54,7 @@ impl ConnectionManager for MemoryConnectionManager {
 
     fn remove_connection_for_streams(
         &self,
-        streams: &Vec<&str>,
+        streams: &Vec<String>,
         connection: Option<SocketAddr>,
     ) -> Result<Option<SocketAddr>, ()> {
         let mut map = self.inner.lock().unwrap();
@@ -83,7 +83,7 @@ impl ConnectionManager for MemoryConnectionManager {
 
     fn get_connections_for_streams(
         &self,
-        streams: &Vec<&str>,
+        streams: &Vec<String>,
     ) -> Vec<Option<SocketAddr>> {
         let mut map = self.inner.lock().unwrap();
 
@@ -101,7 +101,7 @@ impl ConnectionManager for MemoryConnectionManager {
         connections
     }
 
-    fn get_connection_count_for_streams(&self, streams: &Vec<&str>) -> usize {
+    fn get_connection_count_for_streams(&self, streams: &Vec<String>) -> usize {
         self.get_connections_for_streams(streams).len()
     }
 }

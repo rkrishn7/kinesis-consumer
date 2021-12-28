@@ -1,14 +1,16 @@
+use anyhow::Context;
 use rusoto_core::event_stream::EventStream;
 use rusoto_core::{Region, RusotoError};
 use rusoto_kinesis::{
-    Consumer, ConsumerDescription, DescribeStreamConsumerError,
-    DescribeStreamConsumerInput, DescribeStreamError, DescribeStreamInput,
-    ListShardsError, ListShardsInput, ListStreamConsumersError,
-    ListStreamConsumersInput, RegisterStreamConsumerError,
-    RegisterStreamConsumerInput, Shard, StartingPosition, StreamDescription,
-    SubscribeToShardError, SubscribeToShardEventStreamItem,
+    Consumer, ConsumerDescription, DescribeStreamError, DescribeStreamInput,
+    ListShardsInput, ListStreamConsumersError, ListStreamConsumersInput,
+    RegisterStreamConsumerError, RegisterStreamConsumerInput, Shard,
+    StartingPosition, StreamDescription, SubscribeToShardError,
+    SubscribeToShardEventStreamItem,
 };
 use rusoto_kinesis::{Kinesis, KinesisClient};
+
+pub const MAX_REGISTER_STREAM_CONSUMER_TRANSACTIONS_PER_SECOND: usize = 5;
 
 pub fn create_client() -> KinesisClient {
     KinesisClient::new(Region::default())
@@ -32,7 +34,7 @@ pub async fn describe_stream(
 pub async fn list_shards(
     client: &KinesisClient,
     stream_name: String,
-) -> Result<Vec<Shard>, RusotoError<ListShardsError>> {
+) -> Result<Vec<Shard>, anyhow::Error> {
     let mut next_token = None;
     let mut all_shards = Vec::new();
 
@@ -45,7 +47,9 @@ pub async fn list_shards(
             stream_creation_timestamp: None,
             stream_name: Some(stream_name.clone()),
         };
-        let output = client.list_shards(input).await?;
+        let output = client.list_shards(input).await.with_context(|| {
+            format!("Error listing shards for stream {}", stream_name)
+        })?;
 
         if let Some(shards) = output.shards {
             all_shards.extend(shards);
@@ -62,7 +66,7 @@ pub async fn list_shards(
 pub async fn get_shard_ids(
     client: &KinesisClient,
     stream_name: String,
-) -> Result<impl Iterator<Item = String>, RusotoError<ListShardsError>> {
+) -> Result<impl Iterator<Item = String>, anyhow::Error> {
     let shards = list_shards(client, stream_name).await?;
     Ok(shards.into_iter().map(|s| s.shard_id))
 }
@@ -95,44 +99,81 @@ pub async fn register_stream_consumer(
     client: &KinesisClient,
     consumer_name: String,
     stream_arn: String,
-) -> Result<Consumer, RusotoError<RegisterStreamConsumerError>> {
+) -> Result<Consumer, anyhow::Error> {
+    let error_msg = format!(
+        "Error registering stream consumer {} for stream {}",
+        consumer_name, stream_arn
+    );
+
     let input = RegisterStreamConsumerInput {
         consumer_name,
         stream_arn,
     };
 
-    Ok(client.register_stream_consumer(input).await?.consumer)
+    Ok(client
+        .register_stream_consumer(input)
+        .await
+        .context(error_msg)?
+        .consumer)
 }
 
-pub async fn register_stream_consumer_if_not_exists(
+pub async fn get_or_register_stream_consumer(
     client: &KinesisClient,
     consumer_name: String,
     stream_arn: String,
-) -> Result<(), RusotoError<RegisterStreamConsumerError>> {
-    match register_stream_consumer(client, consumer_name, stream_arn).await {
-        Ok(_) => Ok(()),
-        Err(RusotoError::Service(
-            RegisterStreamConsumerError::ResourceInUse(_),
-        )) => Ok(()),
-        Err(e) => Err(e),
+) -> Result<Consumer, anyhow::Error> {
+    match register_stream_consumer(
+        client,
+        consumer_name.to_owned(),
+        stream_arn.to_owned(),
+    )
+    .await
+    {
+        Ok(consumer) => Ok(consumer),
+        Err(e) => {
+            // If the consumer has already been registered, attempt to
+            // synthesize a `Consumer` from its description
+            if let Some(RusotoError::Service(
+                RegisterStreamConsumerError::ResourceInUse(_),
+            )) = e.downcast_ref::<RusotoError<RegisterStreamConsumerError>>()
+            {
+                let consumer_description =
+                    describe_stream_consumer(client, consumer_name, stream_arn)
+                        .await?;
+
+                Ok(Consumer {
+                    consumer_arn: consumer_description.consumer_arn,
+                    consumer_creation_timestamp: consumer_description
+                        .consumer_creation_timestamp,
+                    consumer_name: consumer_description.consumer_name,
+                    consumer_status: consumer_description.consumer_status,
+                })
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
 pub async fn describe_stream_consumer(
     client: &KinesisClient,
-    consumer_name: Option<String>,
-    stream_arn: Option<String>,
-    consumer_arn: Option<String>,
-) -> Result<ConsumerDescription, RusotoError<DescribeStreamConsumerError>> {
-    let input = DescribeStreamConsumerInput {
-        consumer_name,
-        stream_arn,
-        consumer_arn,
+    consumer_name: String,
+    stream_arn: String,
+) -> Result<ConsumerDescription, anyhow::Error> {
+    let error_msg = format!(
+        "Error describing stream consumer {} for stream {}",
+        consumer_name, stream_arn
+    );
+    let input = rusoto_kinesis::DescribeStreamConsumerInput {
+        consumer_name: Some(consumer_name),
+        stream_arn: Some(stream_arn),
+        ..rusoto_kinesis::DescribeStreamConsumerInput::default()
     };
 
     Ok(client
         .describe_stream_consumer(input)
-        .await?
+        .await
+        .context(error_msg)?
         .consumer_description)
 }
 

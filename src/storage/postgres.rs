@@ -4,24 +4,24 @@ use async_trait::async_trait;
 
 use std::sync::Arc;
 
+use lazy_static::lazy_static;
+
 const CONSUMER_LEASES_TABLE_NAME: &'static str =
     "kinesis_butler_consumer_leases";
 
+lazy_static! {
+    static ref PROCESS_ID: uuid::Uuid = uuid::Uuid::new_v4();
+}
 #[derive(Clone)]
 pub struct PostgresKinesisStorageBackend {
     client: Option<Arc<tokio_postgres::Client>>,
     connection_url: String,
-    consumer_id: &'static uuid::Uuid,
 }
 
 impl PostgresKinesisStorageBackend {
-    pub fn new(
-        consumer_id: &'static uuid::Uuid,
-        connection_url: String,
-    ) -> Self {
+    pub fn new(connection_url: String) -> Self {
         Self {
             client: None,
-            consumer_id,
             connection_url,
         }
     }
@@ -36,8 +36,6 @@ impl PostgresKinesisStorageBackend {
         self.client = Some(Arc::new(client));
 
         let client = self.client.clone();
-        let consumer_id = self.consumer_id.clone();
-
         // Release all leases claimed by this consumer, if any,
         // upon graceful shutdown.
         tokio::spawn(async move {
@@ -47,22 +45,26 @@ impl PostgresKinesisStorageBackend {
                 .unwrap()
                 .execute(
                     format!(
-                        "UPDATE {} SET consumer_id = NULL WHERE consumer_id = $1",
+                        "UPDATE {} SET process_id = NULL WHERE process_id = $1",
                         CONSUMER_LEASES_TABLE_NAME
                     )
                     .as_str(),
-                    &[&consumer_id],
+                    &[&*PROCESS_ID],
                 )
-                .await {
-                    Ok(_) => {
-                        println!("Released claimed leases for consumer process {}", consumer_id);
-                        std::process::exit(0)
-                    },
-                    Err(e) => {
-                        eprintln!("Unable to release claimed leases for consumer process {}. Caused by error: {}", consumer_id, e);
-                        std::process::exit(1);
-                    },
+                .await
+            {
+                Ok(_) => {
+                    println!(
+                        "\nReleased claimed leases for consumer process {}",
+                        *PROCESS_ID
+                    );
+                    std::process::exit(0)
                 }
+                Err(e) => {
+                    eprintln!("\nUnable to release claimed leases for process {}. Caused by error: {}", *PROCESS_ID, e);
+                    std::process::exit(1);
+                }
+            }
         });
 
         tokio::spawn(async move {
@@ -81,9 +83,10 @@ impl PostgresKinesisStorageBackend {
               consumer_arn        VARCHAR(255) NOT NULL,
               shard_id            VARCHAR(255) NOT NULL,
               stream_name         VARCHAR(255) NOT NULL,
-              consumer_id         UUID DEFAULT NULL,
+              app_name            VARCHAR(255) NOT NULL,
+              process_id          UUID DEFAULT NULL,
               last_processed_sn   VARCHAR(255) DEFAULT NULL,
-              UNIQUE (consumer_arn, shard_id, stream_name)
+              UNIQUE (consumer_arn, shard_id, stream_name, app_name)
             )",
                     CONSUMER_LEASES_TABLE_NAME
                 )
@@ -104,20 +107,22 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
     async fn claim_available_leases_for_streams(
         &self,
         limit: i64,
-        streams: &Vec<&str>,
+        streams: &Vec<String>,
+        app_name: &str,
     ) -> Result<Vec<ConsumerLease>, Box<dyn std::error::Error>> {
         let rows = self.client.as_ref().unwrap().query(format!(
-                "UPDATE {0} SET consumer_id = $1 WHERE id in (SELECT id FROM {0} WHERE stream_name = ANY($2) AND consumer_id IS NULL LIMIT $3) RETURNING *", CONSUMER_LEASES_TABLE_NAME).as_str(),
-                &[&self.consumer_id, streams, &limit],
+                "UPDATE {0} SET process_id = $1 WHERE id in (SELECT id FROM {0} WHERE stream_name = ANY($2) AND process_id IS NULL AND app_name = $3 LIMIT $4) RETURNING *", CONSUMER_LEASES_TABLE_NAME).as_str(),
+                &[&*PROCESS_ID, streams, &app_name, &limit],
             )
             .await?;
 
         Ok(rows
             .into_iter()
             .map(|row| ConsumerLease {
+                app_name: row.get("app_name"),
                 consumer_arn: row.get("consumer_arn"),
                 shard_id: row.get("shard_id"),
-                consumer_id: row.get("consumer_id"),
+                process_id: row.get("process_id"),
                 stream_name: row.get("stream_name"),
                 last_processed_sn: row.get("last_processed_sn"),
             })
@@ -129,17 +134,19 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
         consumer_arn: &str,
         stream_name: &str,
         shard_id: &str,
+        app_name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self
             .client
             .as_ref()
             .unwrap()
             .execute(
-                format!("INSERT INTO {} (consumer_arn, shard_id, stream_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", CONSUMER_LEASES_TABLE_NAME).as_str(),
+                format!("INSERT INTO {} (consumer_arn, shard_id, stream_name, app_name) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING", CONSUMER_LEASES_TABLE_NAME).as_str(),
                 &[
                     &consumer_arn,
                     &shard_id,
                     &stream_name,
+                    &app_name,
                 ],
             )
             .await?;
@@ -152,19 +159,20 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
         consumer_arn: &str,
         stream_name: &str,
         shard_id: &str,
+        app_name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.client
             .as_ref()
             .unwrap()
             .execute(
                 format!(
-                    "UPDATE {} SET consumer_id = NULL WHERE 
-                consumer_arn = $1 AND shard_id = $2 AND stream_name = $3
+                    "UPDATE {} SET process_id = NULL WHERE 
+                consumer_arn = $1 AND shard_id = $2 AND stream_name = $3 AND app_name = $4
                 ",
                     CONSUMER_LEASES_TABLE_NAME
                 )
                 .as_str(),
-                &[&consumer_arn, &shard_id, &stream_name],
+                &[&consumer_arn, &shard_id, &stream_name, &app_name],
             )
             .await?;
 
@@ -173,11 +181,12 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
 
     async fn get_lease_count_for_streams(
         &self,
-        streams: &Vec<&str>,
+        streams: &Vec<String>,
+        app_name: &str,
     ) -> Result<i64, Box<dyn std::error::Error>> {
         let row = self.client.as_ref().unwrap().query_one(format!(
-        "SELECT COUNT(*) FROM {0} WHERE id in (SELECT id FROM {0} WHERE stream_name = ANY($1))", CONSUMER_LEASES_TABLE_NAME).as_str(),
-        &[streams],
+        "SELECT COUNT(*) FROM {0} WHERE id in (SELECT id FROM {0} WHERE stream_name = ANY($1)) AND app_name = $2", CONSUMER_LEASES_TABLE_NAME).as_str(),
+        &[streams, &app_name],
         )
         .await?;
 
