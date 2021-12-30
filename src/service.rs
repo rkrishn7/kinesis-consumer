@@ -3,7 +3,6 @@ use std::time::Duration;
 use crate::aws::kinesis;
 use crate::connection_manager::ConnectionManager;
 use crate::consumer::lease::ConsumerLease;
-use crate::proto::DataRecord;
 use crate::proto::DataRecords;
 use crate::proto::Lease;
 use crate::storage::AsyncKinesisStorageBackend;
@@ -15,6 +14,7 @@ use rusoto_kinesis::KinesisClient;
 use rusoto_kinesis::SubscribeToShardEventStreamItem;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
+use tokio::time::error::Elapsed;
 
 #[derive(Clone)]
 pub struct KinesisConsumerService<T: Clone, U: Clone> {
@@ -106,60 +106,82 @@ impl<
         Ok(())
     }
 
-    pub async fn serve<G>(
+    async fn try_claim_leases(
         &self,
+        app_name: &str,
+        stream_name: &str,
+    ) -> Result<Vec<ConsumerLease>, anyhow::Error> {
+        let connection_count =
+            self.connection_manager
+                .get_connection_count(app_name, stream_name) as i64;
+
+        let lease_count = self
+            .storage_backend
+            .get_lease_count(stream_name, app_name)
+            .await?;
+
+        let limit = (lease_count + ((connection_count) - 1)) / connection_count;
+
+        Ok(self
+            .storage_backend
+            .claim_available_leases(limit, stream_name, app_name)
+            .await?)
+    }
+
+    async fn try_claim_leases_for_streams(
+        &self,
+        app_name: &str,
+        streams: &Vec<String>,
+    ) -> Result<Vec<ConsumerLease>, anyhow::Error> {
+        let mut leases = Vec::new();
+        for stream_name in streams {
+            leases.extend(
+                self.try_claim_leases(app_name, stream_name.as_str())
+                    .await?
+                    .into_iter(),
+            );
+        }
+
+        Ok(leases)
+    }
+
+    pub async fn serve<G>(
+        &mut self,
         app_name: String,
         streams: Vec<String>,
         tx: Sender<G>,
-    ) where
+    ) -> Result<(), anyhow::Error>
+    where
         G: From<DataRecords> + Send + 'static,
     {
+        self.refresh_consumer_leases(streams.clone(), app_name.clone())
+            .await?;
+
+        self.connection_manager
+            .increment_connections(app_name.as_str(), &streams);
         loop {
-            let connection_count = self
-                .connection_manager
-                .get_connection_count_for_streams(&streams)
-                as i64;
-
-            // In order to evenly distribute shards to record processing clients,
-            // we calculate a limit by dividing the total number of available leases
-            // by the total number of connections, for `streams`. Only `limit` leases
-            // are claimed by this task.
-            let limit = {
-                let lease_count = self
-                    .storage_backend
-                    .get_lease_count_for_streams(&streams, app_name.as_str())
-                    .await
-                    .unwrap();
-
-                (lease_count + ((connection_count) - 1)) / connection_count
-            };
+            if tx.is_closed() {
+                self.connection_manager
+                    .decrement_connections(app_name.as_str(), &streams);
+                break;
+            }
 
             let claimed_leases = self
-                .storage_backend
-                .claim_available_leases_for_streams(
-                    limit,
-                    &streams,
-                    app_name.as_str(),
-                )
-                .await
-                .unwrap();
+                .try_claim_leases_for_streams(app_name.as_str(), &streams)
+                .await?;
+
+            println!("leases {:?}", claimed_leases);
 
             if claimed_leases.len() == 0 {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             } else {
-                let mut consumer_tasks =
-                    self.consume_multiple(claimed_leases, tx.clone());
-
-                while let Some(lease) = consumer_tasks.next().await {
-                    println!("releasing lease");
-                    let lease = lease.unwrap();
-
-                    self.storage_backend
-                    .release_lease(
-                        &lease.consumer_arn,
-                        &lease.stream_name,
-                        &lease.shard_id,
-                        app_name.as_str(),
+                try_join_all(
+                    self.send_multiple(claimed_leases.clone(), tx.clone()),
+                )
+                .await;
+                for lease in claimed_leases.iter() {
+                    self.storage_backend.release_lease(
+                        &lease
                     )
                     .await
                     .expect(format!("Unable to release lease: {}. This may result in shards being starved.", lease).as_str());
@@ -168,25 +190,53 @@ impl<
                 println!("howdy");
             }
         }
+
+        Ok(())
     }
 }
 
-impl<T: AsyncKinesisStorageBackend + Clone, U: Clone>
-    KinesisConsumerService<T, U>
-{
-    /// Consumes records from the Kinesis shard owned by the specified lease.
-    /// Produces sets of data records and sends them on a `mpsc::Channel`.
-    pub fn consume<G>(
+impl<T: Clone, U: Clone> KinesisConsumerService<T, U> {
+    fn send_records<G>(
         &self,
         lease: ConsumerLease,
         tx: Sender<G>,
-    ) -> impl Future<Output = ConsumerLease>
+    ) -> impl Future<Output = ()>
     where
         G: From<DataRecords>,
     {
-        let kinesis_client = self.kinesis_client.clone();
+        let records_stream = self.consume_records(lease);
+
+        let tx1 = tx.clone();
+
+        let fut = async move {
+            tokio::pin!(records_stream);
+
+            while let Some(result) = records_stream.next().await {
+                if let Ok(records) = result {
+                    if let Err(_) = tx.send(records.into()).await {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        };
 
         async move {
+            tokio::select! {
+                _ = tx1.closed() => (),
+                _ = fut => (),
+            }
+        }
+    }
+
+    fn consume_records(
+        &self,
+        lease: ConsumerLease,
+    ) -> impl futures::Stream<Item = Result<DataRecords, ()>> {
+        let kinesis_client = self.kinesis_client.clone();
+
+        async_stream::stream! {
             let starting_position_type = lease.get_starting_position_type();
 
             let mut event_stream = kinesis::subscribe_to_shard(
@@ -200,6 +250,8 @@ impl<T: AsyncKinesisStorageBackend + Clone, U: Clone>
             .await
             .unwrap();
 
+            let lease: Lease = lease.into();
+
             while let Some(item) = event_stream.next().await {
                 match item {
                     Ok(
@@ -207,223 +259,40 @@ impl<T: AsyncKinesisStorageBackend + Clone, U: Clone>
                             event,
                         ),
                     ) => {
-                        let records = DataRecords(
-                            event
-                                .records
-                                .into_iter()
-                                .map(|record| DataRecord {
-                                    sequence_number: record.sequence_number,
-                                    timestamp: record
-                                        .approximate_arrival_timestamp
-                                        .unwrap()
-                                        .to_string(),
-                                    partition_key: record.partition_key,
-                                    encryption_type: record
-                                        .encryption_type
-                                        .unwrap_or(String::from(""))
-                                        .to_string(),
-                                    data: record.data.into_iter().collect(),
-                                    lease: Some(Lease {
-                                        stream_name: lease
-                                            .stream_name
-                                            .to_owned(),
-                                        shard_id: lease.shard_id.to_owned(),
-                                        consumer_arn: lease
-                                            .consumer_arn
-                                            .to_owned(),
-                                    }),
-                                })
-                                .collect(),
-                        );
+                        let mut records: DataRecords = event.records.into();
+                        records.attach_lease(&lease);
 
-                        if let Err(_) = tx.send(records.into()).await {
-                            println!("helo");
-                            break;
-                        }
+                        yield Ok(records);
                     }
-                    Ok(event_stream_error) => {
-                        // TODO: handle
-                        break;
+                    Ok(_event_stream_error) => {
+                        yield Err(());
                     }
-                    Err(rusoto_error) => {
-                        // TODO: handle
-                        break;
+                    Err(_rusoto_error) => {
+                        yield Err(());
                     }
                 }
             }
-
-            println!("gi");
-            lease
         }
     }
 }
 
-impl<T: AsyncKinesisStorageBackend + Clone + 'static, U: Clone + 'static>
-    KinesisConsumerService<T, U>
-{
-    pub fn consume_multiple<G>(
+impl<T: Clone + 'static, U: Clone + 'static> KinesisConsumerService<T, U> {
+    fn send_multiple<G>(
         &self,
         leases: Vec<ConsumerLease>,
         tx: Sender<G>,
-    ) -> FuturesUnordered<JoinHandle<ConsumerLease>>
+    ) -> FuturesUnordered<JoinHandle<Result<(), Elapsed>>>
     where
         G: From<DataRecords> + Send + 'static,
     {
         leases
             .into_iter()
-            .map(|lease| tokio::spawn(self.consume(lease, tx.clone())))
-            .collect::<FuturesUnordered<JoinHandle<ConsumerLease>>>()
+            .map(|lease| {
+                tokio::spawn(tokio::time::timeout(
+                    Duration::from_secs(20),
+                    self.send_records(lease, tx.clone()),
+                ))
+            })
+            .collect::<FuturesUnordered<JoinHandle<Result<(), Elapsed>>>>()
     }
 }
-
-// tokio::spawn(async move {
-//     loop {
-//         let app_name = app_name.clone();
-//         let connection_count = connection_manager
-//             .get_connection_count_for_streams(&streams)
-//             as i64;
-
-//         // In order to evenly distribute shards to record processing clients,
-//         // we calculate a limit by dividing the total number of available leases
-//         // by the total number of connections, for `streams`. Only `limit` leases
-//         // are claimed by this task.
-//         let limit = {
-//             let lease_count = storage_backend
-//                 .get_lease_count_for_streams(
-//                     &streams,
-//                     app_name.as_str(),
-//                 )
-//                 .await
-//                 .unwrap();
-
-//             (lease_count + ((connection_count) - 1)) / connection_count
-//         };
-
-//         println!("limit {}", limit);
-
-//         let claimed_leases = storage_backend
-//             .claim_available_leases_for_streams(
-//                 limit,
-//                 &streams,
-//                 app_name.as_str(),
-//             )
-//             .await
-//             .unwrap();
-
-//         let mut task_handles = Vec::new();
-
-//         for lease in claimed_leases {
-//             let record_sender = record_sender.clone();
-//             let storage_backend = storage_backend.clone();
-//             let kinesis_client = kinesis_client.clone();
-//             let connection_manager = connection_manager.clone();
-//             let streams = streams.clone();
-//             let app_name = app_name.clone();
-
-//             task_handles.push(tokio::task::spawn(async move {
-//                   let starting_position_type;
-//                   match &lease.last_processed_sn {
-//                       Some(_) => starting_position_type = "AFTER_SEQUENCE_NUMBER".to_string(),
-//                       None => starting_position_type = "TRIM_HORIZON".to_string(),
-//                   }
-
-//                   let mut event_stream = kinesis::subscribe_to_shard(
-//                       &kinesis_client,
-//                       (&lease.shard_id).to_owned(),
-//                       (&lease.consumer_arn).to_owned(),
-//                       starting_position_type,
-//                       None,
-//                       lease.last_processed_sn.clone())
-//                       .await.unwrap();
-
-//                   while let Some(item) = event_stream.next().await {
-//                       // When the client's connection drops, we must break so
-//                       // we don't keep tasks unnecessarily running.
-//                       if connection_count != (connection_manager.get_connection_count_for_streams(&streams) as i64) {
-//                           println!("connection imbalance");
-//                           break;
-//                       }
-
-//                       match item {
-//                           Ok(payload) => {
-//                               println!(
-//                                   "Got event from the event stream: {:?}",
-//                                   payload
-//                               );
-//                               println!("shard id: {}", lease.shard_id);
-
-//                               match payload {
-//                                   rusoto_kinesis::SubscribeToShardEventStreamItem::SubscribeToShardEvent(e) => {
-//                                       let mut send_records: Vec<DataRecord> = Vec::new();
-
-//                                       send_records.extend(
-//                                           e.records.into_iter().map(|record| {
-//                                               DataRecord {
-//                                                   sequence_number: record.sequence_number,
-//                                                   timestamp: record.approximate_arrival_timestamp.unwrap().to_string(),
-//                                                   partition_key: record.partition_key,
-//                                                   encryption_type: record.encryption_type.unwrap_or(String::from("")).to_string(),
-//                                                   data: record.data.into_iter().collect(),
-//                                                   lease: Some(
-//                                                       Lease {
-//                                                           stream_name: lease.stream_name.to_owned(),
-//                                                           shard_id: lease.shard_id.to_owned(),
-//                                                           consumer_arn: lease.consumer_arn.to_owned()
-//                                                       }
-//                                                     ),
-//                                               }
-//                                           })
-//                                       );
-
-//                                       match record_sender.send(Ok(GetRecordsResponse {
-//                                           records: send_records,
-//                                       })).await {
-//                                           Ok(_) => (),
-//                                           Err(e) => {
-//                                               println!("{}", e);
-//                                               break
-//                                           },
-//                                       }
-//                                   },
-//                                   _ => todo!(),
-//                               }
-//                           }
-//                           Err(e) => {
-//                               println!("{:?}", e);
-//                           }
-//                       }
-//                     }
-
-//                   storage_backend
-//                       .release_lease(
-//                           &lease.consumer_arn,
-//                           &lease.stream_name,
-//                           &lease.shard_id,
-//                           app_name.as_str(),
-//                       )
-//                       .await
-//                       .expect(format!("Unable to release lease: {}. This may result in shards being starved.", lease).as_str());
-//             }));
-//         }
-
-//         let should_sleep = task_handles.len() == 0;
-
-//         tokio::select! {
-//           _ = &mut stream_dropped_receiver => {
-//               println!("connection dropped");
-//             connection_manager
-//                 .remove_connection_for_streams(&streams, remote_addr)
-//                 .expect(
-//                     "Unable to remove connection.
-//             This will result in an incorrect shard distribution across record
-//             processors, which may result in shards being starved",
-//                 );
-//             break;
-//           },
-//           _ = tokio::time::sleep(Duration::from_secs(5)), if should_sleep => {
-//               println!("sleeping");
-//           },
-//           _ = futures::future::join_all(task_handles), if !should_sleep => ()
-//         }
-//     }
-// });

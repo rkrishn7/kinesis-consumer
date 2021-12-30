@@ -18,6 +18,19 @@ pub struct PostgresKinesisStorageBackend {
     connection_url: String,
 }
 
+impl From<tokio_postgres::Row> for ConsumerLease {
+    fn from(row: tokio_postgres::Row) -> Self {
+        Self {
+            app_name: row.get("app_name"),
+            consumer_arn: row.get("consumer_arn"),
+            shard_id: row.get("shard_id"),
+            process_id: row.get("process_id"),
+            stream_name: row.get("stream_name"),
+            last_processed_sn: row.get("last_processed_sn"),
+        }
+    }
+}
+
 impl PostgresKinesisStorageBackend {
     pub fn new(connection_url: String) -> Self {
         Self {
@@ -104,29 +117,19 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
         unimplemented!()
     }
 
-    async fn claim_available_leases_for_streams(
+    async fn claim_available_leases(
         &self,
         limit: i64,
-        streams: &Vec<String>,
+        stream_name: &str,
         app_name: &str,
-    ) -> Result<Vec<ConsumerLease>, Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<Vec<ConsumerLease>> {
         let rows = self.client.as_ref().unwrap().query(format!(
-                "UPDATE {0} SET process_id = $1 WHERE id in (SELECT id FROM {0} WHERE stream_name = ANY($2) AND process_id IS NULL AND app_name = $3 LIMIT $4) RETURNING *", CONSUMER_LEASES_TABLE_NAME).as_str(),
-                &[&*PROCESS_ID, streams, &app_name, &limit],
-            )
-            .await?;
+            "UPDATE {0} SET process_id = $1 WHERE id in (SELECT id FROM {0} WHERE stream_name = $2 AND process_id IS NULL AND app_name = $3 LIMIT $4) RETURNING *", CONSUMER_LEASES_TABLE_NAME).as_str(),
+            &[&*PROCESS_ID, &stream_name, &app_name, &limit],
+        )
+        .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| ConsumerLease {
-                app_name: row.get("app_name"),
-                consumer_arn: row.get("consumer_arn"),
-                shard_id: row.get("shard_id"),
-                process_id: row.get("process_id"),
-                stream_name: row.get("stream_name"),
-                last_processed_sn: row.get("last_processed_sn"),
-            })
-            .collect())
+        Ok(rows.into_iter().map(|row| row.into()).collect())
     }
 
     async fn create_lease_if_not_exists(
@@ -135,7 +138,7 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
         stream_name: &str,
         shard_id: &str,
         app_name: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<()> {
         let _ = self
             .client
             .as_ref()
@@ -154,13 +157,7 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
         Ok(())
     }
 
-    async fn release_lease(
-        &self,
-        consumer_arn: &str,
-        stream_name: &str,
-        shard_id: &str,
-        app_name: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn release_lease(&self, lease: &ConsumerLease) -> anyhow::Result<()> {
         self.client
             .as_ref()
             .unwrap()
@@ -172,21 +169,21 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
                     CONSUMER_LEASES_TABLE_NAME
                 )
                 .as_str(),
-                &[&consumer_arn, &shard_id, &stream_name, &app_name],
+                &[&lease.consumer_arn, &lease.shard_id, &lease.stream_name, &lease.app_name],
             )
             .await?;
 
         Ok(())
     }
 
-    async fn get_lease_count_for_streams(
+    async fn get_lease_count(
         &self,
-        streams: &Vec<String>,
+        stream_name: &str,
         app_name: &str,
-    ) -> Result<i64, Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<i64> {
         let row = self.client.as_ref().unwrap().query_one(format!(
-        "SELECT COUNT(*) FROM {0} WHERE id in (SELECT id FROM {0} WHERE stream_name = ANY($1)) AND app_name = $2", CONSUMER_LEASES_TABLE_NAME).as_str(),
-        &[streams, &app_name],
+        "SELECT COUNT(*) FROM {0} WHERE stream_name = $1 AND app_name = $2", CONSUMER_LEASES_TABLE_NAME).as_str(),
+        &[&stream_name, &app_name],
         )
         .await?;
 

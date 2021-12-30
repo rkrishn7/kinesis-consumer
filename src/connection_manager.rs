@@ -1,28 +1,35 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+
 pub trait ConnectionManager {
-    fn add_connection_for_streams(
+    fn increment_connections(&self, app_name: &str, streams: &Vec<String>);
+    fn decrement_connections(
         &self,
+        app_name: &str,
         streams: &Vec<String>,
-        connection: Option<SocketAddr>,
-    );
-    fn remove_connection_for_streams(
-        &self,
-        streams: &Vec<String>,
-        connection: Option<SocketAddr>,
-    ) -> Result<Option<SocketAddr>, ()>;
-    fn get_connections_for_streams(
-        &self,
-        streams: &Vec<String>,
-    ) -> Vec<Option<SocketAddr>>;
-    fn get_connection_count_for_streams(&self, streams: &Vec<String>) -> usize;
+    ) -> Result<(), ()>;
+    fn get_connection_count(&self, app_name: &str, stream: &str) -> usize;
+}
+
+#[derive(PartialEq, Eq, Hash, Clone)]
+struct ConnectionKey {
+    app_name: String,
+    stream_name: String,
+}
+
+impl ConnectionKey {
+    pub fn new(app_name: String, stream_name: String) -> Self {
+        Self {
+            app_name,
+            stream_name,
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct MemoryConnectionManager {
-    inner: Arc<Mutex<HashMap<String, Vec<Option<SocketAddr>>>>>,
+    inner: Arc<Mutex<HashMap<ConnectionKey, usize>>>,
 }
 
 impl MemoryConnectionManager {
@@ -34,74 +41,46 @@ impl MemoryConnectionManager {
 }
 
 impl ConnectionManager for MemoryConnectionManager {
-    fn add_connection_for_streams(
-        &self,
-        streams: &Vec<String>,
-        connection: Option<SocketAddr>,
-    ) {
-        let mut map = self.inner.lock().unwrap();
+    fn increment_connections(&self, app_name: &str, streams: &Vec<String>) {
         for stream in streams.iter() {
-            match map.entry(stream.to_string()) {
+            let key =
+                ConnectionKey::new(app_name.to_string(), stream.to_owned());
+            match self.inner.lock().unwrap().entry(key) {
                 Entry::Occupied(mut e) => {
-                    e.get_mut().push(connection);
+                    *e.get_mut() += 1;
                 }
                 Entry::Vacant(e) => {
-                    e.insert(vec![connection]);
+                    e.insert(1);
                 }
             }
         }
     }
 
-    fn remove_connection_for_streams(
+    fn decrement_connections(
         &self,
+        app_name: &str,
         streams: &Vec<String>,
-        connection: Option<SocketAddr>,
-    ) -> Result<Option<SocketAddr>, ()> {
-        let mut map = self.inner.lock().unwrap();
-
+    ) -> Result<(), ()> {
         for stream in streams.iter() {
-            match map.entry(stream.to_string()) {
+            let key =
+                ConnectionKey::new(app_name.to_string(), stream.to_owned());
+            match self.inner.lock().unwrap().entry(key) {
                 Entry::Occupied(mut e) => {
-                    match e.get().iter().position(|sa| *sa == connection) {
-                        Some(idx) => {
-                            let conn = e.get_mut().remove(idx);
-                            return Ok(conn);
-                        }
-                        None => {
-                            return Err(());
-                        }
-                    }
+                    *e.get_mut() -= 1;
                 }
-                Entry::Vacant(_) => {
-                    return Err(());
-                }
+                Entry::Vacant(_) => return Err(()),
             }
         }
 
-        Err(())
+        Ok(())
     }
 
-    fn get_connections_for_streams(
-        &self,
-        streams: &Vec<String>,
-    ) -> Vec<Option<SocketAddr>> {
-        let mut map = self.inner.lock().unwrap();
+    fn get_connection_count(&self, app_name: &str, stream: &str) -> usize {
+        let key = ConnectionKey::new(app_name.to_string(), stream.to_string());
 
-        let mut connections = Vec::new();
-
-        for stream in streams.iter() {
-            match map.entry(stream.to_string()) {
-                Entry::Occupied(e) => {
-                    connections.extend(e.get().clone());
-                }
-                Entry::Vacant(_) => (),
-            }
+        match self.inner.lock().unwrap().get(&key) {
+            Some(count) => *count,
+            None => 0,
         }
-
-        connections
-    }
-
-    fn get_connection_count_for_streams(&self, streams: &Vec<String>) -> usize {
-        self.get_connections_for_streams(streams).len()
     }
 }
