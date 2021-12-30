@@ -1,15 +1,22 @@
+use async_trait::async_trait;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[async_trait]
 pub trait ConnectionManager {
-    fn increment_connections(&self, app_name: &str, streams: &Vec<String>);
-    fn decrement_connections(
+    async fn increment_connections(
+        &self,
+        app_name: &str,
+        streams: &Vec<String>,
+    );
+    async fn decrement_connections(
         &self,
         app_name: &str,
         streams: &Vec<String>,
     ) -> Result<(), ()>;
-    fn get_connection_count(&self, app_name: &str, stream: &str) -> usize;
+    async fn get_connection_count(&self, app_name: &str, stream: &str)
+        -> usize;
 }
 
 #[derive(PartialEq, Eq, Hash, Clone)]
@@ -40,8 +47,13 @@ impl MemoryConnectionManager {
     }
 }
 
+#[async_trait]
 impl ConnectionManager for MemoryConnectionManager {
-    fn increment_connections(&self, app_name: &str, streams: &Vec<String>) {
+    async fn increment_connections(
+        &self,
+        app_name: &str,
+        streams: &Vec<String>,
+    ) {
         for stream in streams.iter() {
             let key =
                 ConnectionKey::new(app_name.to_string(), stream.to_owned());
@@ -56,7 +68,7 @@ impl ConnectionManager for MemoryConnectionManager {
         }
     }
 
-    fn decrement_connections(
+    async fn decrement_connections(
         &self,
         app_name: &str,
         streams: &Vec<String>,
@@ -75,7 +87,11 @@ impl ConnectionManager for MemoryConnectionManager {
         Ok(())
     }
 
-    fn get_connection_count(&self, app_name: &str, stream: &str) -> usize {
+    async fn get_connection_count(
+        &self,
+        app_name: &str,
+        stream: &str,
+    ) -> usize {
         let key = ConnectionKey::new(app_name.to_string(), stream.to_string());
 
         match self.inner.lock().unwrap().get(&key) {

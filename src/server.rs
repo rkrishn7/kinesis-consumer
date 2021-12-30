@@ -1,6 +1,6 @@
 use tonic::{Response, Status};
 
-use crate::storage::AsyncKinesisStorageBackend;
+use crate::storage::KinesisStorageBackend;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -10,14 +10,14 @@ use crate::proto::{
     GetRecordsResponse,
 };
 
-use crate::service::KinesisConsumerService;
+use crate::kinesis_butler::KinesisButler;
 
 use crate::connection_manager::ConnectionManager;
 
 #[tonic::async_trait]
-impl<T, U> ConsumerService for KinesisConsumerService<T, U>
+impl<T, U> ConsumerService for KinesisButler<T, U>
 where
-    T: AsyncKinesisStorageBackend + Send + Sync + Clone + 'static,
+    T: KinesisStorageBackend + Send + Sync + Clone + 'static,
     U: ConnectionManager + Send + Sync + Clone + 'static,
 {
     type GetRecordsStream = ReceiverStream<Result<GetRecordsResponse, Status>>;

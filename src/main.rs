@@ -1,18 +1,18 @@
 mod aws;
 mod connection_manager;
 mod consumer;
+mod kinesis_butler;
 mod proto;
-mod receiver_aware_stream;
 mod server;
-mod service;
 mod storage;
 
+use sqlx::postgres::PgPoolOptions;
 use tonic::transport::Server;
 
 use storage::postgres::PostgresKinesisStorageBackend;
 
+use kinesis_butler::KinesisButler;
 use proto::consumer_service_server::ConsumerServiceServer;
-use service::KinesisConsumerService;
 
 use connection_manager::MemoryConnectionManager;
 
@@ -30,19 +30,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
     postgres_storage_backend
-        .init()
+        .init(PgPoolOptions::new())
         .await
-        .expect("Unable to initialize postgres storage backend");
+        .expect("Unable to initialize PostgreSQL storage backend");
     let kinesis_client = aws::kinesis::create_client();
     let connection_manager = MemoryConnectionManager::new();
-    let consumer = KinesisConsumerService::new(
+    let consumer_service = KinesisButler::new(
         postgres_storage_backend,
         kinesis_client,
         connection_manager,
     );
 
     Server::builder()
-        .add_service(ConsumerServiceServer::new(consumer))
+        .add_service(ConsumerServiceServer::new(consumer_service))
         .serve(addr)
         .await?;
 

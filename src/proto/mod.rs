@@ -37,9 +37,9 @@ impl From<DataRecords> for Result<GetRecordsResponse, tonic::Status> {
 impl From<ConsumerLease> for Lease {
     fn from(lease: ConsumerLease) -> Self {
         Self {
-            stream_name: lease.stream_name,
-            shard_id: lease.shard_id,
-            consumer_arn: lease.consumer_arn,
+            stream_name: lease.stream_name().to_owned(),
+            shard_id: lease.shard_id().to_owned(),
+            consumer_arn: lease.consumer_arn().to_owned(),
         }
     }
 }

@@ -1,11 +1,11 @@
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug, sqlx::FromRow)]
 pub struct ConsumerLease {
-    pub consumer_arn: String,
-    pub app_name: String,
-    pub shard_id: String,
-    pub process_id: uuid::Uuid,
-    pub stream_name: String,
-    pub last_processed_sn: Option<String>,
+    app_name: String,
+    consumer_arn: String,
+    last_processed_sn: Option<String>,
+    process_id: uuid::Uuid,
+    shard_id: String,
+    stream_name: String,
 }
 
 impl ConsumerLease {
@@ -15,6 +15,30 @@ impl ConsumerLease {
         }
 
         return "AFTER_SEQUENCE_NUMBER";
+    }
+
+    pub fn app_name(&self) -> &String {
+        &self.app_name
+    }
+
+    pub fn consumer_arn(&self) -> &String {
+        &self.consumer_arn
+    }
+
+    pub fn last_processed_sn(&self) -> &Option<String> {
+        &self.last_processed_sn
+    }
+
+    pub fn process_id(&self) -> &uuid::Uuid {
+        &self.process_id
+    }
+
+    pub fn shard_id(&self) -> &String {
+        &self.shard_id
+    }
+
+    pub fn stream_name(&self) -> &String {
+        &self.stream_name
     }
 }
 

@@ -5,7 +5,7 @@ use crate::connection_manager::ConnectionManager;
 use crate::consumer::lease::ConsumerLease;
 use crate::proto::DataRecords;
 use crate::proto::Lease;
-use crate::storage::AsyncKinesisStorageBackend;
+use crate::storage::KinesisStorageBackend;
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::Future;
@@ -17,13 +17,13 @@ use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 
 #[derive(Clone)]
-pub struct KinesisConsumerService<T: Clone, U: Clone> {
+pub struct KinesisButler<T: Clone, U: Clone> {
     pub storage_backend: T,
     pub kinesis_client: KinesisClient,
     pub connection_manager: U,
 }
 
-impl<T: Clone, U: Clone> KinesisConsumerService<T, U> {
+impl<T: Clone, U: Clone> KinesisButler<T, U> {
     pub fn new(
         storage_backend: T,
         client: KinesisClient,
@@ -44,11 +44,11 @@ impl<T: Clone, U: Clone> KinesisConsumerService<T, U> {
 }
 
 impl<
-        T: AsyncKinesisStorageBackend + Clone + Send + Sync + 'static,
+        T: KinesisStorageBackend + Clone + Send + Sync + 'static,
         U: ConnectionManager + Clone + Send + Sync + 'static,
-    > KinesisConsumerService<T, U>
+    > KinesisButler<T, U>
 {
-    pub async fn refresh_consumer_leases(
+    async fn refresh_consumer_leases(
         &self,
         streams: Vec<String>,
         app_name: String,
@@ -111,9 +111,10 @@ impl<
         app_name: &str,
         stream_name: &str,
     ) -> Result<Vec<ConsumerLease>, anyhow::Error> {
-        let connection_count =
-            self.connection_manager
-                .get_connection_count(app_name, stream_name) as i64;
+        let connection_count = self
+            .connection_manager
+            .get_connection_count(app_name, stream_name)
+            .await as i64;
 
         let lease_count = self
             .storage_backend
@@ -121,6 +122,8 @@ impl<
             .await?;
 
         let limit = (lease_count + ((connection_count) - 1)) / connection_count;
+
+        println!("limit {}", limit);
 
         Ok(self
             .storage_backend
@@ -154,23 +157,39 @@ impl<
     where
         G: From<DataRecords> + Send + 'static,
     {
+        let storage_backend = self.storage_backend.clone();
+
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.unwrap();
+
+            let mut status = 0;
+
+            if let Err(_) = storage_backend.release_claimed_leases().await {
+                eprintln!("Unable to release claimed leases.");
+                status = 1;
+            }
+
+            std::process::exit(status);
+        });
+
         self.refresh_consumer_leases(streams.clone(), app_name.clone())
             .await?;
 
         self.connection_manager
-            .increment_connections(app_name.as_str(), &streams);
+            .increment_connections(app_name.as_str(), &streams)
+            .await;
+
         loop {
             if tx.is_closed() {
                 self.connection_manager
-                    .decrement_connections(app_name.as_str(), &streams);
+                    .decrement_connections(app_name.as_str(), &streams)
+                    .await;
                 break;
             }
 
             let claimed_leases = self
                 .try_claim_leases_for_streams(app_name.as_str(), &streams)
                 .await?;
-
-            println!("leases {:?}", claimed_leases);
 
             if claimed_leases.len() == 0 {
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -186,8 +205,6 @@ impl<
                     .await
                     .expect(format!("Unable to release lease: {}. This may result in shards being starved.", lease).as_str());
                 }
-
-                println!("howdy");
             }
         }
 
@@ -195,7 +212,7 @@ impl<
     }
 }
 
-impl<T: Clone, U: Clone> KinesisConsumerService<T, U> {
+impl<T: Clone, U: Clone> KinesisButler<T, U> {
     fn send_records<G>(
         &self,
         lease: ConsumerLease,
@@ -241,11 +258,11 @@ impl<T: Clone, U: Clone> KinesisConsumerService<T, U> {
 
             let mut event_stream = kinesis::subscribe_to_shard(
                 &kinesis_client,
-                (&lease.shard_id).to_owned(),
-                (&lease.consumer_arn).to_owned(),
+                lease.shard_id().to_owned(),
+                lease.consumer_arn().to_owned(),
                 starting_position_type.to_string(),
                 None,
-                lease.last_processed_sn.clone(),
+                lease.last_processed_sn().clone(),
             )
             .await
             .unwrap();
@@ -276,7 +293,7 @@ impl<T: Clone, U: Clone> KinesisConsumerService<T, U> {
     }
 }
 
-impl<T: Clone + 'static, U: Clone + 'static> KinesisConsumerService<T, U> {
+impl<T: Clone + 'static, U: Clone + 'static> KinesisButler<T, U> {
     fn send_multiple<G>(
         &self,
         leases: Vec<ConsumerLease>,
