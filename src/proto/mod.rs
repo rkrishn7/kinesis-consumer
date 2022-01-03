@@ -1,4 +1,6 @@
-use crate::consumer::lease::ConsumerLease;
+use std::str::FromStr;
+
+use crate::consumer_lease::ConsumerLease;
 
 tonic::include_proto!("kinesisbutler");
 
@@ -40,6 +42,8 @@ impl From<ConsumerLease> for Lease {
             stream_name: lease.stream_name().to_owned(),
             shard_id: lease.shard_id().to_owned(),
             consumer_arn: lease.consumer_arn().to_owned(),
+            app_name: lease.app_name().to_owned(),
+            instance_id: lease.instance_id().clone().to_string(),
         }
     }
 }
@@ -50,13 +54,10 @@ impl From<rusoto_kinesis::Record> for DataRecord {
             sequence_number: record.sequence_number,
             timestamp: record
                 .approximate_arrival_timestamp
-                .unwrap()
-                .to_string(),
+                .map(|t| t.to_string())
+                .unwrap_or(String::from("")),
             partition_key: record.partition_key,
-            encryption_type: record
-                .encryption_type
-                .unwrap_or(String::from(""))
-                .to_string(),
+            encryption_type: record.encryption_type.unwrap_or(String::from("")),
             data: record.data.into_iter().collect(),
             lease: None,
         }

@@ -1,23 +1,19 @@
 use super::KinesisStorageBackend;
-use crate::consumer::lease::ConsumerLease;
+use crate::consumer_lease::ConsumerLease;
 use async_trait::async_trait;
 
 use sqlx::postgres::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Executor;
 
-use lazy_static::lazy_static;
-
 const CONSUMER_LEASES_TABLE_NAME: &'static str =
     "kinesis_butler_consumer_leases";
 
-lazy_static! {
-    static ref PROCESS_ID: uuid::Uuid = uuid::Uuid::new_v4();
-}
 #[derive(Clone)]
 pub struct PostgresKinesisStorageBackend {
     pool: Option<PgPool>,
     connection_uri: String,
+    instance_id: uuid::Uuid,
 }
 
 impl PostgresKinesisStorageBackend {
@@ -25,6 +21,7 @@ impl PostgresKinesisStorageBackend {
         Self {
             pool: None,
             connection_uri,
+            instance_id: uuid::Uuid::new_v4(),
         }
     }
 
@@ -40,7 +37,7 @@ impl PostgresKinesisStorageBackend {
                 shard_id            VARCHAR(255) NOT NULL,
                 stream_name         VARCHAR(255) NOT NULL,
                 app_name            VARCHAR(255) NOT NULL,
-                process_id          UUID DEFAULT NULL,
+                instance_id         UUID DEFAULT NULL,
                 last_processed_sn   VARCHAR(255) DEFAULT NULL,
                 UNIQUE (consumer_arn, shard_id, stream_name, app_name)
             )",
@@ -62,8 +59,36 @@ impl PostgresKinesisStorageBackend {
 impl KinesisStorageBackend for PostgresKinesisStorageBackend {
     type Error = sqlx::Error;
 
-    async fn checkpoint_consumer(&mut self, sequence_number: &String) {
-        unimplemented!()
+    async fn checkpoint_lease(
+        &self,
+        lease: &ConsumerLease,
+        last_processed_sn: &str,
+    ) -> Result<(), Self::Error> {
+        let sql = format!(
+            "UPDATE {}
+            SET
+                last_processed_sn = $1
+            WHERE
+                consumer_arn = $2
+            AND
+                shard_id = $3
+            AND
+                stream_name = $4
+            AND
+                app_name = $5
+            ",
+            CONSUMER_LEASES_TABLE_NAME
+        );
+
+        sqlx::query(sql.as_str())
+            .bind(last_processed_sn)
+            .bind(lease.consumer_arn())
+            .bind(lease.shard_id())
+            .bind(lease.stream_name())
+            .bind(lease.app_name())
+            .execute(self.pool())
+            .await
+            .map(|_| ())
     }
 
     async fn claim_available_leases(
@@ -75,7 +100,7 @@ impl KinesisStorageBackend for PostgresKinesisStorageBackend {
         let sql = format!(
             "UPDATE {0}
             SET
-                process_id = $1
+                instance_id = $1
             WHERE
                 id IN (
                         SELECT id
@@ -83,7 +108,7 @@ impl KinesisStorageBackend for PostgresKinesisStorageBackend {
                         WHERE
                             stream_name = $2
                         AND
-                            process_id IS NULL
+                            instance_id IS NULL
                         AND
                             app_name = $3
                         LIMIT $4
@@ -93,7 +118,7 @@ impl KinesisStorageBackend for PostgresKinesisStorageBackend {
         );
 
         sqlx::query_as::<_, ConsumerLease>(sql.as_str())
-            .bind(&*PROCESS_ID)
+            .bind(&self.instance_id)
             .bind(stream_name)
             .bind(app_name)
             .bind(limit)
@@ -140,7 +165,7 @@ impl KinesisStorageBackend for PostgresKinesisStorageBackend {
         let sql = format!(
             "UPDATE {}
             SET
-                process_id = NULL
+                instance_id = NULL
             WHERE
                 consumer_arn = $1
             AND
@@ -159,21 +184,21 @@ impl KinesisStorageBackend for PostgresKinesisStorageBackend {
             .bind(lease.app_name())
             .execute(self.pool())
             .await
-            .map(|rows| ())
+            .map(|_| ())
     }
 
     async fn release_claimed_leases(&self) -> Result<(), Self::Error> {
         let sql = format!(
             "UPDATE {}
             SET
-                process_id = NULL
+                instance_id = NULL
             WHERE
-                process_id = $1",
+                instance_id = $1",
             CONSUMER_LEASES_TABLE_NAME
         );
 
         sqlx::query(sql.as_str())
-            .bind(&*PROCESS_ID)
+            .bind(&self.instance_id)
             .execute(self.pool())
             .await
             .map(|_| ())

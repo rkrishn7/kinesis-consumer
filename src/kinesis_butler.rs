@@ -1,10 +1,10 @@
 use std::time::Duration;
 
 use crate::aws::kinesis;
-use crate::connection_manager::ConnectionManager;
-use crate::consumer::lease::ConsumerLease;
+use crate::consumer_lease::ConsumerLease;
 use crate::proto::DataRecords;
 use crate::proto::Lease;
+use crate::record_processor::RecordProcessorRegister;
 use crate::storage::KinesisStorageBackend;
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
@@ -14,13 +14,12 @@ use rusoto_kinesis::KinesisClient;
 use rusoto_kinesis::SubscribeToShardEventStreamItem;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
-use tokio::time::error::Elapsed;
 
 #[derive(Clone)]
 pub struct KinesisButler<T: Clone, U: Clone> {
     pub storage_backend: T,
     pub kinesis_client: KinesisClient,
-    pub connection_manager: U,
+    pub record_processor_register: U,
 }
 
 impl<T: Clone, U: Clone> KinesisButler<T, U> {
@@ -32,7 +31,7 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
         Self {
             storage_backend,
             kinesis_client: client,
-            connection_manager,
+            record_processor_register: connection_manager,
         }
     }
 
@@ -45,7 +44,7 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
 
 impl<
         T: KinesisStorageBackend + Clone + Send + Sync + 'static,
-        U: ConnectionManager + Clone + Send + Sync + 'static,
+        U: RecordProcessorRegister + Clone + Send + Sync + 'static,
     > KinesisButler<T, U>
 {
     async fn refresh_consumer_leases(
@@ -112,8 +111,8 @@ impl<
         stream_name: &str,
     ) -> Result<Vec<ConsumerLease>, anyhow::Error> {
         let connection_count = self
-            .connection_manager
-            .get_connection_count(app_name, stream_name)
+            .record_processor_register
+            .get_count(app_name.into(), stream_name.into())
             .await as i64;
 
         let lease_count = self
@@ -122,8 +121,6 @@ impl<
             .await?;
 
         let limit = (lease_count + ((connection_count) - 1)) / connection_count;
-
-        println!("limit {}", limit);
 
         Ok(self
             .storage_backend
@@ -148,15 +145,7 @@ impl<
         Ok(leases)
     }
 
-    pub async fn serve<G>(
-        &mut self,
-        app_name: String,
-        streams: Vec<String>,
-        tx: Sender<G>,
-    ) -> Result<(), anyhow::Error>
-    where
-        G: From<DataRecords> + Send + 'static,
-    {
+    pub fn listen_shutdown(&self) {
         let storage_backend = self.storage_backend.clone();
 
         tokio::spawn(async move {
@@ -171,41 +160,35 @@ impl<
 
             std::process::exit(status);
         });
+    }
 
+    pub async fn serve<G>(
+        &mut self,
+        app_name: String,
+        streams: Vec<String>,
+        tx: Sender<G>,
+    ) -> Result<(), anyhow::Error>
+    where
+        G: From<DataRecords> + Send + 'static,
+    {
         self.refresh_consumer_leases(streams.clone(), app_name.clone())
             .await?;
 
-        self.connection_manager
-            .increment_connections(app_name.as_str(), &streams)
-            .await;
+        let claimed_leases = self
+            .try_claim_leases_for_streams(app_name.as_str(), &streams)
+            .await?;
 
-        loop {
-            if tx.is_closed() {
-                self.connection_manager
-                    .decrement_connections(app_name.as_str(), &streams)
-                    .await;
-                break;
-            }
-
-            let claimed_leases = self
-                .try_claim_leases_for_streams(app_name.as_str(), &streams)
-                .await?;
-
-            if claimed_leases.len() == 0 {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            } else {
-                try_join_all(
-                    self.send_multiple(claimed_leases.clone(), tx.clone()),
-                )
-                .await;
-                for lease in claimed_leases.iter() {
-                    self.storage_backend.release_lease(
-                        &lease
-                    )
-                    .await
-                    .expect(format!("Unable to release lease: {}. This may result in shards being starved.", lease).as_str());
-                }
-            }
+        let mut tasks = self.send_multiple(
+            claimed_leases.clone(),
+            tx,
+            Duration::from_secs(20),
+        );
+        while let Some(Ok(lease)) = tasks.next().await {
+            self.storage_backend.release_lease(
+                &lease
+            )
+            .await
+            .expect(format!("Unable to release lease: {:?}. This may result in shards being starved.", lease).as_str());
         }
 
         Ok(())
@@ -217,15 +200,17 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
         &self,
         lease: ConsumerLease,
         tx: Sender<G>,
-    ) -> impl Future<Output = ()>
+        duration: Duration,
+    ) -> impl Future<Output = ConsumerLease>
     where
         G: From<DataRecords>,
     {
-        let records_stream = self.consume_records(lease);
+        let consume_records_fut = self.consume_records(lease.clone());
 
         let tx1 = tx.clone();
 
         let fut = async move {
+            let records_stream = consume_records_fut.await;
             tokio::pin!(records_stream);
 
             while let Some(result) = records_stream.next().await {
@@ -241,8 +226,8 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
 
         async move {
             tokio::select! {
-                _ = tx1.closed() => (),
-                _ = fut => (),
+                _ = tx1.closed() => lease,
+                _ = tokio::time::timeout(duration, fut) => lease,
             }
         }
     }
@@ -250,10 +235,12 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
     fn consume_records(
         &self,
         lease: ConsumerLease,
-    ) -> impl futures::Stream<Item = Result<DataRecords, ()>> {
+    ) -> impl futures::Future<
+        Output = impl futures::Stream<Item = Result<DataRecords, ()>>,
+    > {
         let kinesis_client = self.kinesis_client.clone();
 
-        async_stream::stream! {
+        async move {
             let starting_position_type = lease.get_starting_position_type();
 
             let mut event_stream = kinesis::subscribe_to_shard(
@@ -269,23 +256,29 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
 
             let lease: Lease = lease.into();
 
-            while let Some(item) = event_stream.next().await {
-                match item {
-                    Ok(
-                        SubscribeToShardEventStreamItem::SubscribeToShardEvent(
-                            event,
-                        ),
-                    ) => {
-                        let mut records: DataRecords = event.records.into();
-                        records.attach_lease(&lease);
+            async_stream::stream! {
+                while let Some(item) = event_stream.next().await {
+                    match item {
+                        Ok(
+                            SubscribeToShardEventStreamItem::SubscribeToShardEvent(
+                                event,
+                            ),
+                        ) => {
+                            if event.records.len() == 0 {
+                                continue;
+                            }
 
-                        yield Ok(records);
-                    }
-                    Ok(_event_stream_error) => {
-                        yield Err(());
-                    }
-                    Err(_rusoto_error) => {
-                        yield Err(());
+                            let mut records: DataRecords = event.records.into();
+                            records.attach_lease(&lease);
+
+                            yield Ok(records);
+                        }
+                        Ok(_event_stream_error) => {
+                            yield Err(());
+                        }
+                        Err(_rusoto_error) => {
+                            yield Err(());
+                        }
                     }
                 }
             }
@@ -298,18 +291,16 @@ impl<T: Clone + 'static, U: Clone + 'static> KinesisButler<T, U> {
         &self,
         leases: Vec<ConsumerLease>,
         tx: Sender<G>,
-    ) -> FuturesUnordered<JoinHandle<Result<(), Elapsed>>>
+        duration: Duration,
+    ) -> FuturesUnordered<JoinHandle<ConsumerLease>>
     where
         G: From<DataRecords> + Send + 'static,
     {
         leases
             .into_iter()
             .map(|lease| {
-                tokio::spawn(tokio::time::timeout(
-                    Duration::from_secs(20),
-                    self.send_records(lease, tx.clone()),
-                ))
+                tokio::spawn(self.send_records(lease, tx.clone(), duration))
             })
-            .collect::<FuturesUnordered<JoinHandle<Result<(), Elapsed>>>>()
+            .collect::<FuturesUnordered<JoinHandle<ConsumerLease>>>()
     }
 }

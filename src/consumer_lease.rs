@@ -1,9 +1,13 @@
+use std::str::FromStr;
+
+use crate::proto::Lease;
+
 #[derive(PartialEq, Eq, Clone, Debug, sqlx::FromRow)]
 pub struct ConsumerLease {
     app_name: String,
     consumer_arn: String,
     last_processed_sn: Option<String>,
-    process_id: uuid::Uuid,
+    instance_id: uuid::Uuid,
     shard_id: String,
     stream_name: String,
 }
@@ -29,8 +33,8 @@ impl ConsumerLease {
         &self.last_processed_sn
     }
 
-    pub fn process_id(&self) -> &uuid::Uuid {
-        &self.process_id
+    pub fn instance_id(&self) -> &uuid::Uuid {
+        &self.instance_id
     }
 
     pub fn shard_id(&self) -> &String {
@@ -42,15 +46,17 @@ impl ConsumerLease {
     }
 }
 
-impl std::fmt::Display for ConsumerLease {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "(stream_name: {}, shard_id: {}, consumer_arn: {}, app_name: {})",
-            &self.stream_name,
-            &self.shard_id,
-            &self.consumer_arn,
-            &self.app_name
-        )
+impl TryFrom<Lease> for ConsumerLease {
+    type Error = uuid::Error;
+
+    fn try_from(lease: Lease) -> Result<Self, Self::Error> {
+        Ok(Self {
+            stream_name: lease.stream_name,
+            shard_id: lease.shard_id,
+            consumer_arn: lease.consumer_arn,
+            app_name: lease.app_name,
+            instance_id: uuid::Uuid::from_str(lease.instance_id.as_str())?,
+            last_processed_sn: None,
+        })
     }
 }

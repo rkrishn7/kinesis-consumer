@@ -1,8 +1,8 @@
 mod aws;
-mod connection_manager;
-mod consumer;
+mod consumer_lease;
 mod kinesis_butler;
 mod proto;
+mod record_processor;
 mod server;
 mod storage;
 
@@ -14,7 +14,7 @@ use storage::postgres::PostgresKinesisStorageBackend;
 use kinesis_butler::KinesisButler;
 use proto::consumer_service_server::ConsumerServiceServer;
 
-use connection_manager::MemoryConnectionManager;
+use record_processor::MemoryRecordProcessorRegister;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,15 +34,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .expect("Unable to initialize PostgreSQL storage backend");
     let kinesis_client = aws::kinesis::create_client();
-    let connection_manager = MemoryConnectionManager::new();
-    let consumer_service = KinesisButler::new(
+    let record_processor_register = MemoryRecordProcessorRegister::new();
+    let kinesis_butler = KinesisButler::new(
         postgres_storage_backend,
         kinesis_client,
-        connection_manager,
+        record_processor_register,
     );
 
+    kinesis_butler.listen_shutdown();
+
     Server::builder()
-        .add_service(ConsumerServiceServer::new(consumer_service))
+        .add_service(ConsumerServiceServer::new(kinesis_butler))
         .serve(addr)
         .await?;
 

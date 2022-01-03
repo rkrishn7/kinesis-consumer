@@ -1,6 +1,6 @@
 pub mod postgres;
 
-use crate::consumer::lease::ConsumerLease;
+use crate::consumer_lease::ConsumerLease;
 use async_trait::async_trait;
 
 use std::error::Error as StdError;
@@ -9,7 +9,11 @@ use std::error::Error as StdError;
 pub trait KinesisStorageBackend {
     type Error: StdError + Send + Sync;
 
-    async fn checkpoint_consumer(&mut self, sequence_number: &String);
+    async fn checkpoint_lease(
+        &self,
+        lease: &ConsumerLease,
+        last_processed_sn: &str,
+    ) -> Result<(), Self::Error>;
     async fn claim_available_leases(
         &self,
         limit: i64,
