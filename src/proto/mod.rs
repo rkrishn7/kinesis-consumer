@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use crate::consumer_lease::ConsumerLease;
 
 tonic::include_proto!("kinesisbutler");

@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+};
 
 #[async_trait]
 pub trait RecordProcessorRegister {
@@ -20,9 +23,15 @@ pub trait RecordProcessorRegister {
     async fn get_count(&self, app_name: String, stream_name: String) -> usize;
 }
 
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Key {
+    app_name: String,
+    stream_name: String,
+}
+
 #[derive(Clone)]
 pub struct MemoryRecordProcessorRegister(
-    Arc<Mutex<BTreeMap<(String, String), Vec<SocketAddr>>>>,
+    Arc<Mutex<BTreeMap<Key, BTreeSet<SocketAddr>>>>,
 );
 
 impl MemoryRecordProcessorRegister {
@@ -41,27 +50,31 @@ impl RecordProcessorRegister for MemoryRecordProcessorRegister {
     ) {
         let map = &mut *self.0.lock().unwrap();
         for stream in streams {
-            map.entry((app_name.clone(), stream))
-                .or_default()
-                .push(socket_addr);
+            let key = Key {
+                app_name: app_name.clone(),
+                stream_name: stream,
+            };
+
+            map.entry(key).or_default().insert(socket_addr);
         }
     }
 
     async fn get_count(&self, app_name: String, stream_name: String) -> usize {
         let map = &*self.0.lock().unwrap();
 
-        map.get(&(app_name, stream_name))
-            .map(|v| v.len())
-            .unwrap_or(0)
+        let key = Key {
+            app_name,
+            stream_name,
+        };
+
+        map.get(&key).map(|v| v.len()).unwrap_or(0)
     }
 
     async fn remove(&self, socket_addr: SocketAddr) {
         let map = &mut *self.0.lock().unwrap();
 
         for val in map.values_mut() {
-            if let Some(idx) = val.iter().position(|x| *x == socket_addr) {
-                val.remove(idx);
-            }
+            val.remove(&socket_addr);
         }
     }
 
@@ -73,7 +86,12 @@ impl RecordProcessorRegister for MemoryRecordProcessorRegister {
     ) -> bool {
         let map = &*self.0.lock().unwrap();
 
-        if let Some(v) = map.get(&(app_name, stream_name)) {
+        let key = Key {
+            app_name,
+            stream_name,
+        };
+
+        if let Some(v) = map.get(&key) {
             return v.contains(&socket_addr);
         }
 

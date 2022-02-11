@@ -47,6 +47,9 @@ impl<
         U: RecordProcessorRegister + Clone + Send + Sync + 'static,
     > KinesisButler<T, U>
 {
+    /// For a given set of streams, namespaced by `app_name`, create/update a lease entry
+    /// in our database. Since this involves multiple requests to get stream metadata, create
+    /// a task for each stream and run them concurrently.
     async fn refresh_consumer_leases(
         &self,
         streams: Vec<String>,

@@ -3,9 +3,8 @@ use rusoto_core::event_stream::EventStream;
 use rusoto_core::{Region, RusotoError};
 use rusoto_kinesis::{
     Consumer, ConsumerDescription, DescribeStreamError, DescribeStreamInput,
-    ListShardsInput, ListStreamConsumersError, ListStreamConsumersInput,
-    RegisterStreamConsumerError, RegisterStreamConsumerInput, Shard,
-    StartingPosition, StreamDescription, SubscribeToShardError,
+    ListShardsInput, RegisterStreamConsumerError, RegisterStreamConsumerInput,
+    Shard, StartingPosition, StreamDescription, SubscribeToShardError,
     SubscribeToShardEventStreamItem,
 };
 use rusoto_kinesis::{Kinesis, KinesisClient};
@@ -175,33 +174,4 @@ pub async fn describe_stream_consumer(
         .await
         .context(error_msg)?
         .consumer_description)
-}
-
-pub async fn list_stream_consumers(
-    client: &KinesisClient,
-    stream_arn: String,
-) -> Result<Vec<Consumer>, RusotoError<ListStreamConsumersError>> {
-    let mut next_token = None;
-    let mut all_consumers = Vec::new();
-
-    loop {
-        let input = ListStreamConsumersInput {
-            max_results: None,
-            next_token,
-            stream_arn: stream_arn.clone(),
-            stream_creation_timestamp: None,
-        };
-
-        let output = client.list_stream_consumers(input).await?;
-
-        if let Some(consumers) = output.consumers {
-            all_consumers.extend(consumers);
-        }
-
-        if output.next_token.is_some() {
-            next_token = output.next_token;
-        } else {
-            break Ok(all_consumers);
-        }
-    }
 }

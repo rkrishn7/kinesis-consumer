@@ -39,7 +39,7 @@ impl PostgresKinesisStorageBackend {
                 app_name            VARCHAR(255) NOT NULL,
                 instance_id         UUID DEFAULT NULL,
                 last_processed_sn   VARCHAR(255) DEFAULT NULL,
-                UNIQUE (consumer_arn, shard_id, stream_name, app_name)
+                UNIQUE (shard_id, stream_name, app_name)
             )",
             CONSUMER_LEASES_TABLE_NAME
         );
