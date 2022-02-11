@@ -1,127 +1,129 @@
-use super::AsyncKinesisStorageBackend;
-use crate::consumer::lease::ConsumerLease;
+use super::KinesisStorageBackend;
+use crate::consumer_lease::ConsumerLease;
 use async_trait::async_trait;
 
-use std::sync::Arc;
+use sqlx::postgres::PgPool;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::Executor;
 
 const CONSUMER_LEASES_TABLE_NAME: &'static str =
     "kinesis_butler_consumer_leases";
 
 #[derive(Clone)]
 pub struct PostgresKinesisStorageBackend {
-    client: Option<Arc<tokio_postgres::Client>>,
-    connection_url: String,
-    consumer_id: &'static uuid::Uuid,
+    pool: Option<PgPool>,
+    connection_uri: String,
+    instance_id: uuid::Uuid,
 }
 
 impl PostgresKinesisStorageBackend {
-    pub fn new(
-        consumer_id: &'static uuid::Uuid,
-        connection_url: String,
-    ) -> Self {
+    pub fn new(connection_uri: String) -> Self {
         Self {
-            client: None,
-            consumer_id,
-            connection_url,
+            pool: None,
+            connection_uri,
+            instance_id: uuid::Uuid::new_v4(),
         }
     }
 
-    pub async fn init(&mut self) -> Result<(), tokio_postgres::Error> {
-        let (client, connection) = tokio_postgres::connect(
-            &self.connection_url,
-            tokio_postgres::NoTls,
-        )
-        .await?;
+    fn pool(&self) -> &PgPool {
+        self.pool.as_ref().unwrap()
+    }
 
-        self.client = Some(Arc::new(client));
-
-        let client = self.client.clone();
-        let consumer_id = self.consumer_id.clone();
-
-        // Release all leases claimed by this consumer, if any,
-        // upon graceful shutdown.
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.unwrap();
-            match client
-                .as_ref()
-                .unwrap()
-                .execute(
-                    format!(
-                        "UPDATE {} SET consumer_id = NULL WHERE consumer_id = $1",
-                        CONSUMER_LEASES_TABLE_NAME
-                    )
-                    .as_str(),
-                    &[&consumer_id],
-                )
-                .await {
-                    Ok(_) => {
-                        println!("Released claimed leases for consumer process {}", consumer_id);
-                        std::process::exit(0)
-                    },
-                    Err(e) => {
-                        eprintln!("Unable to release claimed leases for consumer process {}. Caused by error: {}", consumer_id, e);
-                        std::process::exit(1);
-                    },
-                }
-        });
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("connection error: {}", e);
-            }
-        });
-
-        self.client
-            .as_ref()
-            .unwrap()
-            .batch_execute(
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {} ( 
-              id                  SERIAL NOT NULL PRIMARY KEY,
-              consumer_arn        VARCHAR(255) NOT NULL,
-              shard_id            VARCHAR(255) NOT NULL,
-              stream_name         VARCHAR(255) NOT NULL,
-              consumer_id         UUID DEFAULT NULL,
-              last_processed_sn   VARCHAR(255) DEFAULT NULL,
-              UNIQUE (consumer_arn, shard_id, stream_name)
+    async fn create_leases_table(&self) -> sqlx::Result<()> {
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {} ( 
+                id                  SERIAL NOT NULL PRIMARY KEY,
+                consumer_arn        VARCHAR(255) NOT NULL,
+                shard_id            VARCHAR(255) NOT NULL,
+                stream_name         VARCHAR(255) NOT NULL,
+                app_name            VARCHAR(255) NOT NULL,
+                instance_id         UUID DEFAULT NULL,
+                last_processed_sn   VARCHAR(255) DEFAULT NULL,
+                UNIQUE (shard_id, stream_name, app_name)
             )",
-                    CONSUMER_LEASES_TABLE_NAME
-                )
-                .as_str(),
-            )
-            .await?;
+            CONSUMER_LEASES_TABLE_NAME
+        );
 
-        Ok(())
+        let mut conn = self.pool().acquire().await?;
+
+        conn.execute(sql.as_str()).await.map(|_| ())
+    }
+
+    pub async fn init(&mut self, options: PgPoolOptions) -> sqlx::Result<()> {
+        self.pool = Some(options.connect(self.connection_uri.as_str()).await?);
+        self.create_leases_table().await
     }
 }
 
 #[async_trait]
-impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
-    async fn checkpoint_consumer(&mut self, sequence_number: &String) {
-        unimplemented!()
+impl KinesisStorageBackend for PostgresKinesisStorageBackend {
+    type Error = sqlx::Error;
+
+    async fn checkpoint_lease(
+        &self,
+        lease: &ConsumerLease,
+        last_processed_sn: &str,
+    ) -> Result<(), Self::Error> {
+        let sql = format!(
+            "UPDATE {}
+            SET
+                last_processed_sn = $1
+            WHERE
+                consumer_arn = $2
+            AND
+                shard_id = $3
+            AND
+                stream_name = $4
+            AND
+                app_name = $5
+            ",
+            CONSUMER_LEASES_TABLE_NAME
+        );
+
+        sqlx::query(sql.as_str())
+            .bind(last_processed_sn)
+            .bind(lease.consumer_arn())
+            .bind(lease.shard_id())
+            .bind(lease.stream_name())
+            .bind(lease.app_name())
+            .execute(self.pool())
+            .await
+            .map(|_| ())
     }
 
-    async fn claim_available_leases_for_streams(
+    async fn claim_available_leases(
         &self,
         limit: i64,
-        streams: &Vec<&str>,
-    ) -> Result<Vec<ConsumerLease>, Box<dyn std::error::Error>> {
-        let rows = self.client.as_ref().unwrap().query(format!(
-                "UPDATE {0} SET consumer_id = $1 WHERE id in (SELECT id FROM {0} WHERE stream_name = ANY($2) AND consumer_id IS NULL LIMIT $3) RETURNING *", CONSUMER_LEASES_TABLE_NAME).as_str(),
-                &[&self.consumer_id, streams, &limit],
-            )
-            .await?;
+        stream_name: &str,
+        app_name: &str,
+    ) -> Result<Vec<ConsumerLease>, Self::Error> {
+        let sql = format!(
+            "UPDATE {0}
+            SET
+                instance_id = $1
+            WHERE
+                id IN (
+                        SELECT id
+                        FROM {0}
+                        WHERE
+                            stream_name = $2
+                        AND
+                            instance_id IS NULL
+                        AND
+                            app_name = $3
+                        LIMIT $4
+                    )
+            RETURNING *",
+            CONSUMER_LEASES_TABLE_NAME
+        );
 
-        Ok(rows
-            .into_iter()
-            .map(|row| ConsumerLease {
-                consumer_arn: row.get("consumer_arn"),
-                shard_id: row.get("shard_id"),
-                consumer_id: row.get("consumer_id"),
-                stream_name: row.get("stream_name"),
-                last_processed_sn: row.get("last_processed_sn"),
-            })
-            .collect())
+        sqlx::query_as::<_, ConsumerLease>(sql.as_str())
+            .bind(&self.instance_id)
+            .bind(stream_name)
+            .bind(app_name)
+            .bind(limit)
+            .fetch_all(self.pool())
+            .await
     }
 
     async fn create_lease_if_not_exists(
@@ -129,58 +131,101 @@ impl AsyncKinesisStorageBackend for PostgresKinesisStorageBackend {
         consumer_arn: &str,
         stream_name: &str,
         shard_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = self
-            .client
-            .as_ref()
-            .unwrap()
-            .execute(
-                format!("INSERT INTO {} (consumer_arn, shard_id, stream_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", CONSUMER_LEASES_TABLE_NAME).as_str(),
-                &[
-                    &consumer_arn,
-                    &shard_id,
-                    &stream_name,
-                ],
-            )
-            .await?;
+        app_name: &str,
+    ) -> Result<(), Self::Error> {
+        let sql = format!(
+            "INSERT INTO {} (
+                consumer_arn,
+                shard_id,
+                stream_name,
+                app_name
+            ) VALUES (
+                $1,
+                $2,
+                $3, 
+                $4
+            ) ON CONFLICT DO NOTHING",
+            CONSUMER_LEASES_TABLE_NAME,
+        );
 
-        Ok(())
+        sqlx::query(sql.as_str())
+            .bind(consumer_arn)
+            .bind(shard_id)
+            .bind(stream_name)
+            .bind(app_name)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
     }
 
     async fn release_lease(
         &self,
-        consumer_arn: &str,
-        stream_name: &str,
-        shard_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.client
-            .as_ref()
-            .unwrap()
-            .execute(
-                format!(
-                    "UPDATE {} SET consumer_id = NULL WHERE 
-                consumer_arn = $1 AND shard_id = $2 AND stream_name = $3
-                ",
-                    CONSUMER_LEASES_TABLE_NAME
-                )
-                .as_str(),
-                &[&consumer_arn, &shard_id, &stream_name],
-            )
-            .await?;
+        lease: &ConsumerLease,
+    ) -> Result<(), Self::Error> {
+        let sql = format!(
+            "UPDATE {}
+            SET
+                instance_id = NULL
+            WHERE
+                consumer_arn = $1
+            AND
+                shard_id = $2
+            AND
+                stream_name = $3
+            AND
+                app_name = $4",
+            CONSUMER_LEASES_TABLE_NAME
+        );
 
-        Ok(())
+        sqlx::query(sql.as_str())
+            .bind(lease.consumer_arn())
+            .bind(lease.shard_id())
+            .bind(lease.stream_name())
+            .bind(lease.app_name())
+            .execute(self.pool())
+            .await
+            .map(|_| ())
     }
 
-    async fn get_lease_count_for_streams(
-        &self,
-        streams: &Vec<&str>,
-    ) -> Result<i64, Box<dyn std::error::Error>> {
-        let row = self.client.as_ref().unwrap().query_one(format!(
-        "SELECT COUNT(*) FROM {0} WHERE id in (SELECT id FROM {0} WHERE stream_name = ANY($1))", CONSUMER_LEASES_TABLE_NAME).as_str(),
-        &[streams],
-        )
-        .await?;
+    async fn release_claimed_leases(&self) -> Result<(), Self::Error> {
+        let sql = format!(
+            "UPDATE {}
+            SET
+                instance_id = NULL
+            WHERE
+                instance_id = $1",
+            CONSUMER_LEASES_TABLE_NAME
+        );
 
-        Ok(row.get(0))
+        sqlx::query(sql.as_str())
+            .bind(&self.instance_id)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+    }
+
+    async fn get_lease_count(
+        &self,
+        stream_name: &str,
+        app_name: &str,
+    ) -> Result<i64, Self::Error> {
+        let sql = format!(
+            "SELECT
+                COUNT(*)
+            FROM {0}
+            WHERE
+                stream_name = $1
+            AND
+                app_name = $2",
+            CONSUMER_LEASES_TABLE_NAME
+        );
+
+        let count: (i64,) = sqlx::query_as(sql.as_str())
+            .bind(stream_name)
+            .bind(app_name)
+            .fetch_one(self.pool())
+            .await?;
+
+        Ok(count.0)
     }
 }
