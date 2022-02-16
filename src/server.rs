@@ -12,13 +12,13 @@ use crate::proto::{
 
 use crate::kinesis_butler::KinesisButler;
 
-use crate::record_processor::RecordProcessorRegister;
+use crate::connection_table::ConnectionTable;
 
 #[tonic::async_trait]
 impl<T, U> ConsumerService for KinesisButler<T, U>
 where
     T: KinesisStorageBackend + Send + Sync + Clone + 'static,
-    U: RecordProcessorRegister + Send + Sync + Clone + 'static,
+    U: ConnectionTable + Send + Sync + Clone + 'static,
 {
     type GetRecordsStream = ReceiverStream<Result<GetRecordsResponse, Status>>;
 
@@ -83,7 +83,9 @@ where
         &self,
         request: tonic::Request<InitializeRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        let remote_addr = request.remote_addr().unwrap();
+        let remote_addr = request
+            .remote_addr()
+            .expect("Could not resolve remote address");
         let message = request.into_inner();
 
         self.record_processor_register
@@ -97,7 +99,9 @@ where
         &self,
         request: tonic::Request<()>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        let remote_addr = request.remote_addr().unwrap();
+        let remote_addr = request
+            .remote_addr()
+            .expect("Could not resolve remote address");
 
         self.record_processor_register.remove(remote_addr).await;
 

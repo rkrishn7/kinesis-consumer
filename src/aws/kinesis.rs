@@ -2,9 +2,9 @@ use anyhow::Context;
 use rusoto_core::event_stream::EventStream;
 use rusoto_core::{Region, RusotoError};
 use rusoto_kinesis::{
-    Consumer, ConsumerDescription, DescribeStreamError, DescribeStreamInput,
-    ListShardsInput, RegisterStreamConsumerError, RegisterStreamConsumerInput,
-    Shard, StartingPosition, StreamDescription, SubscribeToShardError,
+    Consumer, ConsumerDescription, DescribeStreamInput, ListShardsInput,
+    RegisterStreamConsumerError, RegisterStreamConsumerInput, Shard,
+    StartingPosition, StreamDescription, SubscribeToShardError,
     SubscribeToShardEventStreamItem,
 };
 use rusoto_kinesis::{Kinesis, KinesisClient};
@@ -20,7 +20,7 @@ pub async fn describe_stream(
     stream_name: String,
     exclusive_start_shard_id: Option<String>,
     shard_limit: Option<i64>,
-) -> Result<StreamDescription, RusotoError<DescribeStreamError>> {
+) -> Result<StreamDescription, anyhow::Error> {
     let input = DescribeStreamInput {
         exclusive_start_shard_id,
         limit: shard_limit,
@@ -174,4 +174,117 @@ pub async fn describe_stream_consumer(
         .await
         .context(error_msg)?
         .consumer_description)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusoto_mock::{MockCredentialsProvider, MockRequestDispatcher};
+
+    #[tokio::test]
+    async fn test_describe_stream() {
+        let stream_description = rusoto_kinesis::StreamDescription {
+            has_more_shards: false,
+            retention_period_hours: 24,
+            stream_arn: String::from("stream-arn"),
+            stream_creation_timestamp: 111222333.0,
+            stream_name: String::from("stream-name"),
+            stream_status: String::from("ACTIVE"),
+            ..Default::default()
+        };
+
+        let client = KinesisClient::new_with(
+            MockRequestDispatcher::default().with_json_body(
+                rusoto_kinesis::DescribeStreamOutput {
+                    stream_description: stream_description.clone(),
+                },
+            ),
+            MockCredentialsProvider,
+            Region::default(),
+        );
+
+        let output =
+            describe_stream(&client, "fake_stream".into(), None, None).await;
+
+        assert_eq!(output.unwrap(), stream_description);
+    }
+
+    #[tokio::test]
+    async fn test_describe_stream_service_error() {
+        let client = KinesisClient::new_with(
+            MockRequestDispatcher::with_status(500),
+            MockCredentialsProvider,
+            Region::default(),
+        );
+
+        let output =
+            describe_stream(&client, "fake_stream".into(), None, None).await;
+
+        assert!(output.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_shards() {
+        let shards = vec![rusoto_kinesis::Shard {
+            hash_key_range: rusoto_kinesis::HashKeyRange {
+                ending_hash_key: String::from(""),
+                starting_hash_key: String::from(""),
+            },
+            sequence_number_range: rusoto_kinesis::SequenceNumberRange {
+                ending_sequence_number: None,
+                starting_sequence_number: String::from("1"),
+            },
+            shard_id: String::from("shard-0001"),
+            ..Default::default()
+        }];
+
+        let client = KinesisClient::new_with(
+            MockRequestDispatcher::default().with_json_body(
+                rusoto_kinesis::ListShardsOutput {
+                    next_token: None,
+                    shards: Some(shards.clone()),
+                },
+            ),
+            MockCredentialsProvider,
+            Region::default(),
+        );
+
+        let output = list_shards(&client, "fake-stream".into()).await;
+
+        assert_eq!(output.unwrap(), shards);
+    }
+
+    #[tokio::test]
+    async fn test_get_shard_ids() {
+        let shards = vec![rusoto_kinesis::Shard {
+            hash_key_range: rusoto_kinesis::HashKeyRange {
+                ending_hash_key: String::from(""),
+                starting_hash_key: String::from(""),
+            },
+            sequence_number_range: rusoto_kinesis::SequenceNumberRange {
+                ending_sequence_number: None,
+                starting_sequence_number: String::from("1"),
+            },
+            shard_id: String::from("shard-0001"),
+            ..Default::default()
+        }];
+
+        let client = KinesisClient::new_with(
+            MockRequestDispatcher::default().with_json_body(
+                rusoto_kinesis::ListShardsOutput {
+                    next_token: None,
+                    shards: Some(shards.clone()),
+                },
+            ),
+            MockCredentialsProvider,
+            Region::default(),
+        );
+
+        let output = get_shard_ids(&client, "fake-stream".into()).await;
+
+        assert_eq!(
+            output.unwrap().collect::<Vec<String>>(),
+            vec![String::from("shard-0001")]
+        );
+    }
 }

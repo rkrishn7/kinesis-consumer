@@ -113,6 +113,9 @@ name = "bytes"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4872d67bab6358e59559027aa3b9157c53d9358c51423c17554809a8858e0f8"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "cc"
@@ -136,6 +139,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "serde",
+ "time",
  "winapi",
 ]
 
@@ -685,6 +689,7 @@ dependencies = [
  "rand 0.7.3",
  "rusoto_core",
  "rusoto_kinesis",
+ "rusoto_mock",
  "serde",
  "serde_json",
  "sqlx",
@@ -1261,6 +1266,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusoto_mock"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5b3ad822f9ff58043dc81172a27f392e2f2aedebd8566c5f4bee4bfd2be021a"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "http",
+ "rusoto_core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rusoto_signature"
 version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1632,6 +1652,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "time"
+version = "0.1.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca8a50ef2360fbd1eeb0ecd46795a87a19024eb4b53c5dc916ca1fd95fe62438"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

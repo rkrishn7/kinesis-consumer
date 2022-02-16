@@ -1,10 +1,10 @@
 use std::time::Duration;
 
 use crate::aws::kinesis;
+use crate::connection_table::ConnectionTable;
 use crate::consumer_lease::ConsumerLease;
 use crate::proto::DataRecords;
 use crate::proto::Lease;
-use crate::record_processor::RecordProcessorRegister;
 use crate::storage::KinesisStorageBackend;
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
@@ -44,11 +44,11 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
 
 impl<
         T: KinesisStorageBackend + Clone + Send + Sync + 'static,
-        U: RecordProcessorRegister + Clone + Send + Sync + 'static,
+        U: ConnectionTable + Clone + Send + Sync + 'static,
     > KinesisButler<T, U>
 {
-    /// For a given set of streams, namespaced by `app_name`, create/update a lease entry
-    /// in our database. Since this involves multiple requests to get stream metadata, create
+    /// For a given set of streams namespaced by `app_name`, create a lease entry
+    /// in our database if it doesn't exist. Since this involves multiple requests to get stream metadata, create
     /// a task for each stream and run them concurrently.
     async fn refresh_consumer_leases(
         &self,
