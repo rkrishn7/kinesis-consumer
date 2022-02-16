@@ -86,10 +86,17 @@ where
         let remote_addr = request
             .remote_addr()
             .expect("Could not resolve remote address");
-        let message = request.into_inner();
+
+        let InitializeRequest { app_name, streams } = request.into_inner();
+
+        self.refresh_consumer_leases(&streams, &app_name)
+            .await
+            .map_err(|_| {
+                tonic::Status::internal("Error occured while refreshing leases")
+            })?;
 
         self.record_processor_register
-            .register(message.app_name, message.streams, remote_addr)
+            .register(app_name, streams, remote_addr)
             .await;
 
         Ok(Response::new(()))
