@@ -1,10 +1,10 @@
 use std::time::Duration;
 
 use crate::aws::kinesis;
+use crate::connection_table::ConnectionTable;
 use crate::consumer_lease::ConsumerLease;
 use crate::proto::DataRecords;
 use crate::proto::Lease;
-use crate::record_processor::RecordProcessorRegister;
 use crate::storage::KinesisStorageBackend;
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
@@ -44,22 +44,23 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
 
 impl<
         T: KinesisStorageBackend + Clone + Send + Sync + 'static,
-        U: RecordProcessorRegister + Clone + Send + Sync + 'static,
+        U: ConnectionTable + Clone + Send + Sync + 'static,
     > KinesisButler<T, U>
 {
-    /// For a given set of streams, namespaced by `app_name`, create/update a lease entry
-    /// in our database. Since this involves multiple requests to get stream metadata, create
-    /// a task for each stream and run them concurrently.
-    async fn refresh_consumer_leases(
+    /// For a given set of streams namespaced by `app_name`, create a lease
+    /// entry in our database if it doesn't exist. Since this involves multiple
+    /// requests to get stream metadata, create a task for each stream and run
+    /// them concurrently.
+    pub async fn refresh_consumer_leases(
         &self,
-        streams: Vec<String>,
-        app_name: String,
+        streams: &Vec<String>,
+        app_name: &String,
     ) -> Result<(), anyhow::Error> {
         // Run tasks in chunks so we don't exceed limits
         for streams in &mut streams[..].chunks(
             kinesis::MAX_REGISTER_STREAM_CONSUMER_TRANSACTIONS_PER_SECOND,
         ) {
-            let handles = streams.into_iter().map(|stream_name| {
+            let handles = streams.iter().map(|stream_name| {
                 let kinesis_client = self.kinesis_client.clone();
                 let storage_backend = self.storage_backend.clone();
                 let app_name = app_name.clone();
@@ -148,23 +149,6 @@ impl<
         Ok(leases)
     }
 
-    pub fn listen_shutdown(&self) {
-        let storage_backend = self.storage_backend.clone();
-
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.unwrap();
-
-            let mut status = 0;
-
-            if let Err(_) = storage_backend.release_claimed_leases().await {
-                eprintln!("Unable to release claimed leases.");
-                status = 1;
-            }
-
-            std::process::exit(status);
-        });
-    }
-
     pub async fn serve<G>(
         &mut self,
         app_name: String,
@@ -174,9 +158,6 @@ impl<
     where
         G: From<DataRecords> + Send + 'static,
     {
-        self.refresh_consumer_leases(streams.clone(), app_name.clone())
-            .await?;
-
         let claimed_leases = self
             .try_claim_leases_for_streams(app_name.as_str(), &streams)
             .await?;
@@ -186,6 +167,7 @@ impl<
             tx,
             Duration::from_secs(20),
         );
+
         while let Some(Ok(lease)) = tasks.next().await {
             self.storage_backend.release_lease(
                 &lease
@@ -213,16 +195,21 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
         let tx1 = tx.clone();
 
         let fut = async move {
-            let records_stream = consume_records_fut.await;
-            tokio::pin!(records_stream);
+            match consume_records_fut.await {
+                Ok(records_stream) => {
+                    tokio::pin!(records_stream);
 
-            while let Some(result) = records_stream.next().await {
-                if let Ok(records) = result {
-                    if let Err(_) = tx.send(records.into()).await {
-                        break;
+                    while let Some(Ok(records)) = records_stream.next().await {
+                        if let Err(_) = tx.send(records.into()).await {
+                            break;
+                        }
                     }
-                } else {
-                    break;
+                }
+                Err(e) => {
+                    println!(
+                        "Encountered error while subscribing to shard {:?}",
+                        e
+                    );
                 }
             }
         };
@@ -239,7 +226,10 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
         &self,
         lease: ConsumerLease,
     ) -> impl futures::Future<
-        Output = impl futures::Stream<Item = Result<DataRecords, ()>>,
+        Output = Result<
+            impl futures::Stream<Item = Result<DataRecords, ()>>,
+            anyhow::Error,
+        >,
     > {
         let kinesis_client = self.kinesis_client.clone();
 
@@ -254,12 +244,11 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
                 None,
                 lease.last_processed_sn().clone(),
             )
-            .await
-            .unwrap();
+            .await?;
 
             let lease: Lease = lease.into();
 
-            async_stream::stream! {
+            Ok(async_stream::stream! {
                 while let Some(item) = event_stream.next().await {
                     match item {
                         Ok(
@@ -284,7 +273,7 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
                         }
                     }
                 }
-            }
+            })
         }
     }
 }

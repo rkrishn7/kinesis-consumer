@@ -188,6 +188,8 @@ impl KinesisStorageBackend for PostgresKinesisStorageBackend {
     }
 
     async fn release_claimed_leases(&self) -> Result<(), Self::Error> {
+        println!("releasing claimed leases");
+
         let sql = format!(
             "UPDATE {}
             SET
