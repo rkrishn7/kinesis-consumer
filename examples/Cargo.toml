@@ -1,0 +1,17 @@
+[package]
+authors = ["Rohan Krishnaswamy <rkrishn7@ucsc.edu>"]
+edition = "2021"
+name = "examples"
+publish = false
+version = "0.1.0"
+
+[[bin]]
+name = "client"
+path = "src/client/main.rs"
+
+[dependencies]
+clap = { version = "3.0.14", features = ["derive"] }
+kinesis-butler = { version = "0.1.0", path = "../kinesis-butler" }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tonic = { version = "0.6", features = ["transport"] }
+futures = "0.3"

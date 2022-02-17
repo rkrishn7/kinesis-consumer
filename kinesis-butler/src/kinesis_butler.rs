@@ -167,6 +167,7 @@ impl<
             tx,
             Duration::from_secs(20),
         );
+
         while let Some(Ok(lease)) = tasks.next().await {
             self.storage_backend.release_lease(
                 &lease

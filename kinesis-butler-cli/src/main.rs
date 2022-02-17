@@ -1,24 +1,16 @@
-mod aws;
-mod connection_table;
-mod consumer_lease;
-mod kinesis_butler;
-mod proto;
-mod server;
-mod storage;
-
 use sqlx::postgres::PgPoolOptions;
 use tonic::transport::Server;
 
-use storage::postgres::PostgresKinesisStorageBackend;
+use kinesis_butler::storage::postgres::PostgresKinesisStorageBackend;
 
+use kinesis_butler::proto::consumer_service_server::ConsumerServiceServer;
 use kinesis_butler::KinesisButler;
-use proto::consumer_service_server::ConsumerServiceServer;
 
-use connection_table::MemoryConnectionTable;
+use kinesis_butler::connection_table::MemoryConnectionTable;
 
 use clap::{ArgEnum, Parser};
 
-use crate::storage::KinesisStorageBackend;
+use kinesis_butler::storage::KinesisStorageBackend;
 
 #[derive(Parser)]
 #[clap(name = "kinesis-butler")]
@@ -57,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = "[::1]:50051".parse()?;
 
-    let kinesis_client = aws::kinesis::create_client();
+    let kinesis_client = kinesis_butler::aws::kinesis::create_client();
     let connection_table = MemoryConnectionTable::new();
     let kinesis_butler = KinesisButler::new(
         storage_backend.clone(),

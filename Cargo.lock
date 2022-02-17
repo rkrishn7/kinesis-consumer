@@ -336,6 +336,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e78d4f1cc4ae33bbfc157ed5d5a5ef3bc29227303d595861deb238fcec4e9457"
 
 [[package]]
+name = "examples"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures",
+ "kinesis-butler",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "fixedbitset"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -746,6 +757,18 @@ dependencies = [
  "tonic",
  "tonic-build",
  "uuid",
+]
+
+[[package]]
+name = "kinesis-butler-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures",
+ "kinesis-butler",
+ "sqlx",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
