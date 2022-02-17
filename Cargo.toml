@@ -9,6 +9,10 @@ edition = "2021"
 name = "kinesis-butler"
 path = "src/main.rs"
 
+[[bin]] # Bin to run the Kinesis Butler gRPC client
+name = "kinesis-butler-client"
+path = "src/client.rs"
+
 
 [dependencies]
 anyhow = "1.0.52"

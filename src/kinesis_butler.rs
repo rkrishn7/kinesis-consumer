@@ -194,12 +194,21 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
         let tx1 = tx.clone();
 
         let fut = async move {
-            let records_stream = consume_records_fut.await;
-            tokio::pin!(records_stream);
+            match consume_records_fut.await {
+                Ok(records_stream) => {
+                    tokio::pin!(records_stream);
 
-            while let Some(Ok(records)) = records_stream.next().await {
-                if let Err(_) = tx.send(records.into()).await {
-                    break;
+                    while let Some(Ok(records)) = records_stream.next().await {
+                        if let Err(_) = tx.send(records.into()).await {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!(
+                        "Encountered error while subscribing to shard {:?}",
+                        e
+                    );
                 }
             }
         };
@@ -216,7 +225,10 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
         &self,
         lease: ConsumerLease,
     ) -> impl futures::Future<
-        Output = impl futures::Stream<Item = Result<DataRecords, ()>>,
+        Output = Result<
+            impl futures::Stream<Item = Result<DataRecords, ()>>,
+            anyhow::Error,
+        >,
     > {
         let kinesis_client = self.kinesis_client.clone();
 
@@ -231,12 +243,11 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
                 None,
                 lease.last_processed_sn().clone(),
             )
-            .await
-            .unwrap();
+            .await?;
 
             let lease: Lease = lease.into();
 
-            async_stream::stream! {
+            Ok(async_stream::stream! {
                 while let Some(item) = event_stream.next().await {
                     match item {
                         Ok(
@@ -261,7 +272,7 @@ impl<T: Clone, U: Clone> KinesisButler<T, U> {
                         }
                     }
                 }
-            }
+            })
         }
     }
 }

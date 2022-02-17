@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Executor;
-use tokio::runtime::Handle;
 
 const CONSUMER_LEASES_TABLE_NAME: &'static str =
     "kinesis_butler_consumer_leases";
@@ -189,6 +188,8 @@ impl KinesisStorageBackend for PostgresKinesisStorageBackend {
     }
 
     async fn release_claimed_leases(&self) -> Result<(), Self::Error> {
+        println!("releasing claimed leases");
+
         let sql = format!(
             "UPDATE {}
             SET
